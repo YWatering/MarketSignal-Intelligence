@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0">
+  <channel>
+    <title>AAPL fixture news</title>
+    <item>
+      <title>Apple supplier update highlights demand outlook</title>
+      <link>https://example.com/aapl/supplier-update</link>
+      <pubDate>Fri, 14 Aug 2026 14:00:00 GMT</pubDate>
+      <source url="https://example.com">Example Finance</source>
+      <description>Fixture article retained for deterministic stage-one validation.</description>
+    </item>
+    <item>
+      <title>Apple supplier update highlights demand outlook</title>
+      <link>https://example.com/aapl/supplier-update</link>
+      <pubDate>Fri, 14 Aug 2026 14:00:00 GMT</pubDate>
+      <source url="https://example.com">Example Finance</source>
+      <description>Duplicate fixture article.</description>
+    </item>
+    <item>
+      <title>Apple shares close after product update</title>
+      <link>https://example.com/aapl/product-update</link>
+      <pubDate>Thu, 13 Aug 2026 13:30:00 GMT</pubDate>
+      <source url="https://example.com">Example Markets</source>
+      <description>Second fixture article.</description>
+    </item>
+    <item>
+      <link>https://example.com/aapl/invalid-item</link>
+      <pubDate>Wed, 12 Aug 2026 13:00:00 GMT</pubDate>
+      <source url="https://example.com">Example Markets</source>
+      <description>Fixture item with no title.</description>
+    </item>
+  </channel>
+</rss>
