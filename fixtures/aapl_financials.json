@@ -1,0 +1,74 @@
+{
+  "cik": 320193,
+  "entityName": "Apple Inc.",
+  "facts": {
+    "us-gaap": {
+      "RevenueFromContractWithCustomerExcludingAssessedTax": {
+        "label": "Revenue from Contract with Customer, Excluding Assessed Tax",
+        "units": {
+          "USD": [
+            {"start": "2026-04-01", "end": "2026-06-30", "val": 94000000000, "fy": 2026, "fp": "Q3", "form": "10-Q", "filed": "2026-08-01", "accn": "0000320193-26-000003"},
+            {"start": "2026-01-01", "end": "2026-03-31", "val": 88000000000, "fy": 2026, "fp": "Q2", "form": "10-Q", "filed": "2026-05-01", "accn": "0000320193-26-000002"}
+          ]
+        }
+      },
+      "NetIncomeLoss": {
+        "label": "Net Income (Loss)",
+        "units": {
+          "USD": [
+            {"start": "2026-04-01", "end": "2026-06-30", "val": 24500000000, "fy": 2026, "fp": "Q3", "form": "10-Q", "filed": "2026-08-01", "accn": "0000320193-26-000003"},
+            {"start": "2026-01-01", "end": "2026-03-31", "val": 23000000000, "fy": 2026, "fp": "Q2", "form": "10-Q", "filed": "2026-05-01", "accn": "0000320193-26-000002"}
+          ]
+        }
+      },
+      "Assets": {
+        "label": "Assets",
+        "units": {
+          "USD": [
+            {"end": "2026-06-30", "val": 364000000000, "fy": 2026, "fp": "Q3", "form": "10-Q", "filed": "2026-08-01", "accn": "0000320193-26-000003"}
+          ]
+        }
+      },
+      "Liabilities": {
+        "label": "Liabilities",
+        "units": {
+          "USD": [
+            {"end": "2026-06-30", "val": 282000000000, "fy": 2026, "fp": "Q3", "form": "10-Q", "filed": "2026-08-01", "accn": "0000320193-26-000003"}
+          ]
+        }
+      },
+      "AssetsCurrent": {
+        "label": "Assets, Current",
+        "units": {
+          "USD": [
+            {"end": "2026-06-30", "val": 124000000000, "fy": 2026, "fp": "Q3", "form": "10-Q", "filed": "2026-08-01", "accn": "0000320193-26-000003"}
+          ]
+        }
+      },
+      "LiabilitiesCurrent": {
+        "label": "Liabilities, Current",
+        "units": {
+          "USD": [
+            {"end": "2026-06-30", "val": 131000000000, "fy": 2026, "fp": "Q3", "form": "10-Q", "filed": "2026-08-01", "accn": "0000320193-26-000003"}
+          ]
+        }
+      },
+      "CashAndCashEquivalentsAtCarryingValue": {
+        "label": "Cash and Cash Equivalents, at Carrying Value",
+        "units": {
+          "USD": [
+            {"end": "2026-06-30", "val": 35000000000, "fy": 2026, "fp": "Q3", "form": "10-Q", "filed": "2026-08-01", "accn": "0000320193-26-000003"}
+          ]
+        }
+      },
+      "NetCashProvidedByUsedInOperatingActivities": {
+        "label": "Net Cash Provided by (Used in) Operating Activities",
+        "units": {
+          "USD": [
+            {"start": "2026-04-01", "end": "2026-06-30", "val": 28000000000, "fy": 2026, "fp": "Q3", "form": "10-Q", "filed": "2026-08-01", "accn": "0000320193-26-000003"}
+          ]
+        }
+      }
+    }
+  }
+}

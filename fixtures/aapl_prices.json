@@ -3,7 +3,7 @@
     "symbol": "AAPL",
     "currency": "USD",
     "interval": "1day",
-    "source": "deterministic-stage-one-fixture"
+    "source": "deterministic-stage-two-fixture"
   },
   "values": [
     {

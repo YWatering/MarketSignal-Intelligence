@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate the deterministic stage-one example workbook."""
+"""Generate the deterministic stage-two example workbook."""
 
 from __future__ import annotations
 

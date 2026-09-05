@@ -1,6 +1,7 @@
 __pycache__/
 *.py[cod]
 .venv/
+.cache/
 .pytest_cache/
 outputs/*.xlsx
 !outputs/aapl_market_signal.xlsx

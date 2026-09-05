@@ -1,7 +1,7 @@
 interface:
   display_name: "MarketSignal Intelligence"
-  short_description: "Collect market data and export traceable Excel reports"
-  default_prompt: "Use $market-signal-intelligence to collect stock, news, and market data and export a traceable Excel report."
+  short_description: "Collect market, SEC financial, filing, and news data to Excel"
+  default_prompt: "Use $market-signal-intelligence to collect single-stock market, SEC financial, filing, and news data, then export a traceable Excel report with basic indicators."
 
 policy:
   allow_implicit_invocation: true

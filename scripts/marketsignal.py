@@ -1,20 +1,24 @@
 #!/usr/bin/env python3
-"""Stage-one data collection, cleaning, and Excel export for MarketSignal Intelligence."""
+"""MarketSignal Intelligence stage-two collection, governance, analysis, and Excel export."""
 
 from __future__ import annotations
 
 import argparse
+import gzip
+import hashlib
 import html
 import json
 import os
 import re
 import ssl
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
 import zipfile
+import zlib
 from datetime import datetime
 from email.utils import parsedate_to_datetime
 from pathlib import Path
@@ -26,12 +30,61 @@ from openpyxl.utils import get_column_letter
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_PRICES_FIXTURE = PROJECT_ROOT / "fixtures" / "aapl_prices.json"
-DEFAULT_NEWS_FIXTURE = PROJECT_ROOT / "fixtures" / "aapl_news.xml"
+FIXTURES_DIR = PROJECT_ROOT / "fixtures"
+DEFAULT_PRICES_FIXTURE = FIXTURES_DIR / "aapl_prices.json"
+DEFAULT_NEWS_FIXTURE = FIXTURES_DIR / "aapl_news.xml"
+DEFAULT_ENTITY_FIXTURE = FIXTURES_DIR / "aapl_entity.json"
+DEFAULT_FINANCIALS_FIXTURE = FIXTURES_DIR / "aapl_financials.json"
+DEFAULT_SUBMISSIONS_FIXTURE = FIXTURES_DIR / "aapl_submissions.json"
+DEFAULT_CACHE_DIR = PROJECT_ROOT / ".cache" / "marketsignal"
+
 TWELVE_DATA_URL = "https://api.twelvedata.com/time_series"
 YAHOO_NEWS_URL = "https://feeds.finance.yahoo.com/rss/2.0/headline"
-USER_AGENT = "MarketSignal-Intelligence/0.1"
+SEC_TICKERS_URL = "https://www.sec.gov/files/company_tickers.json"
+SEC_COMPANYFACTS_URL = "https://data.sec.gov/api/xbrl/companyfacts"
+SEC_SUBMISSIONS_URL = "https://data.sec.gov/submissions"
+
+USER_AGENT = "MarketSignal-Intelligence/0.2"
 DATE_FORMAT = "%Y-%m-%d"
+SEC_FORMS = {"10-K", "10-Q", "8-K"}
+
+FINANCIAL_CONCEPTS = [
+    ("revenue", "Revenue", ["RevenueFromContractWithCustomerExcludingAssessedTax", "SalesRevenueNet"]),
+    ("net_income", "Net income", ["NetIncomeLoss"]),
+    ("assets", "Total assets", ["Assets"]),
+    ("liabilities", "Total liabilities", ["Liabilities"]),
+    ("current_assets", "Current assets", ["AssetsCurrent"]),
+    ("current_liabilities", "Current liabilities", ["LiabilitiesCurrent"]),
+    ("cash_and_equivalents", "Cash and cash equivalents", ["CashAndCashEquivalentsAtCarryingValue"]),
+    ("operating_cash_flow", "Operating cash flow", ["NetCashProvidedByUsedInOperatingActivities"]),
+]
+
+POSITIVE_TERMS = {
+    "beat",
+    "demand",
+    "gain",
+    "growth",
+    "launch",
+    "profit",
+    "record",
+    "strong",
+    "surge",
+    "upgrade",
+}
+NEGATIVE_TERMS = {
+    "cut",
+    "decline",
+    "downgrade",
+    "drop",
+    "fall",
+    "investigation",
+    "lawsuit",
+    "loss",
+    "miss",
+    "risk",
+    "warning",
+    "weak",
+}
 
 
 class PipelineError(RuntimeError):
@@ -46,7 +99,14 @@ def _parse_date(value: str, field_name: str) -> str:
     return parsed.strftime(DATE_FORMAT)
 
 
-def _validate_request(symbol: str, start_date: str | None, end_date: str | None, mode: str, output: Path) -> None:
+def _validate_request(
+    symbol: str,
+    start_date: str | None,
+    end_date: str | None,
+    mode: str,
+    output: Path,
+    announcement_limit: int,
+) -> None:
     if not symbol or len(symbol) > 32 or any(char.isspace() for char in symbol):
         raise PipelineError("symbol must be a non-empty value of at most 32 characters without spaces")
     if mode not in {"fixture", "online"}:
@@ -59,6 +119,8 @@ def _validate_request(symbol: str, start_date: str | None, end_date: str | None,
         raise PipelineError("start_date cannot be later than end_date")
     if output.suffix.lower() != ".xlsx":
         raise PipelineError("output must use the .xlsx extension")
+    if announcement_limit < 1:
+        raise PipelineError("announcement_limit must be at least 1")
 
 
 def _ssl_context() -> ssl.SSLContext:
@@ -76,30 +138,85 @@ def _ssl_context() -> ssl.SSLContext:
     return ssl.create_default_context()
 
 
-def _fetch_text(url: str, timeout: int) -> str:
-    request = urllib.request.Request(
-        url,
-        headers={
-            "Accept": "application/json, application/rss+xml, application/xml, text/xml",
-            "User-Agent": USER_AGENT,
-        },
+def _redact_url(url: str) -> str:
+    parsed = urllib.parse.urlsplit(url)
+    safe_query = []
+    for key, value in urllib.parse.parse_qsl(parsed.query, keep_blank_values=True):
+        safe_query.append((key, "redacted" if key.lower() in {"apikey", "api_key", "token"} else value))
+    return urllib.parse.urlunsplit(
+        (parsed.scheme, parsed.netloc, parsed.path, urllib.parse.urlencode(safe_query), parsed.fragment)
     )
+
+
+def _cache_path(cache_dir: Path, url: str) -> Path:
+    digest = hashlib.sha256(url.encode("utf-8")).hexdigest()
+    return cache_dir / f"{digest}.payload"
+
+
+def _fetch_text(
+    url: str,
+    timeout: int,
+    *,
+    headers: dict[str, str] | None = None,
+    cache_dir: Path | None = None,
+    refresh_cache: bool = False,
+    is_sec_request: bool = False,
+) -> tuple[str, str]:
+    cache_file = _cache_path(cache_dir, url) if cache_dir else None
+    if cache_file and cache_file.exists() and not refresh_cache:
+        return cache_file.read_text(encoding="utf-8"), "hit"
+
+    request_headers = {
+        "Accept": "application/json, application/rss+xml, application/xml, text/xml",
+        "User-Agent": USER_AGENT,
+    }
+    if headers:
+        request_headers.update(headers)
+    if is_sec_request:
+        time.sleep(0.12)
+    request = urllib.request.Request(url, headers=request_headers)
     try:
         with urllib.request.urlopen(request, timeout=timeout, context=_ssl_context()) as response:
-            return response.read().decode("utf-8")
+            raw_content = response.read()
+            encoding = response.headers.get("Content-Encoding", "").lower()
+            if encoding == "gzip":
+                raw_content = gzip.decompress(raw_content)
+            elif encoding == "deflate":
+                raw_content = zlib.decompress(raw_content)
+            content = raw_content.decode("utf-8")
     except (urllib.error.URLError, TimeoutError) as exc:
         reason = getattr(exc, "reason", exc)
-        raise PipelineError(f"source request failed: {url} ({reason})") from exc
+        raise PipelineError(f"source request failed: {_redact_url(url)} ({reason})") from exc
+    if cache_file:
+        cache_file.parent.mkdir(parents=True, exist_ok=True)
+        cache_file.write_text(content, encoding="utf-8")
+    return content, "miss" if cache_file else "disabled"
 
 
-def _fetch_json(url: str, timeout: int) -> dict[str, Any]:
+def _fetch_json(
+    url: str,
+    timeout: int,
+    *,
+    headers: dict[str, str] | None = None,
+    cache_dir: Path | None = None,
+    refresh_cache: bool = False,
+    is_sec_request: bool = False,
+) -> tuple[dict[str, Any], str]:
+    content, cache_status = _fetch_text(
+        url,
+        timeout,
+        headers=headers,
+        cache_dir=cache_dir,
+        refresh_cache=refresh_cache,
+        is_sec_request=is_sec_request,
+    )
     try:
-        payload = json.loads(_fetch_text(url, timeout))
+        payload = json.loads(content)
     except json.JSONDecodeError as exc:
-        raise PipelineError(f"source returned invalid JSON: {url}") from exc
+        raise PipelineError(f"source returned invalid JSON: {_redact_url(url)}") from exc
     if not isinstance(payload, dict):
-        raise PipelineError(f"source returned an unexpected JSON shape: {url}")
-    return payload
+        raise PipelineError(f"source returned an unexpected JSON shape: {_redact_url(url)}")
+    return payload, cache_status
 
 
 def _local_name(tag: str) -> str:
@@ -122,11 +239,14 @@ def _child_element(element: ET.Element, name: str) -> ET.Element | None:
 
 def _load_json(path: Path) -> dict[str, Any]:
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
+        payload = json.loads(path.read_text(encoding="utf-8"))
     except FileNotFoundError as exc:
         raise PipelineError(f"fixture not found: {path}") from exc
     except json.JSONDecodeError as exc:
         raise PipelineError(f"fixture is not valid JSON: {path}") from exc
+    if not isinstance(payload, dict):
+        raise PipelineError(f"fixture has an unexpected JSON shape: {path}")
+    return payload
 
 
 def _load_xml(path: Path) -> ET.Element:
@@ -136,6 +256,13 @@ def _load_xml(path: Path) -> ET.Element:
         raise PipelineError(f"fixture not found: {path}") from exc
     except ET.ParseError as exc:
         raise PipelineError(f"fixture is not valid XML: {path}") from exc
+
+
+def _fixture_location(path: Path) -> str:
+    try:
+        return f"fixture:{path.resolve().relative_to(PROJECT_ROOT)}"
+    except ValueError:
+        return f"fixture:{path}"
 
 
 def _normalize_price_rows(payload: dict[str, Any], source: str) -> list[dict[str, Any]]:
@@ -161,6 +288,19 @@ def _normalize_price_rows(payload: dict[str, Any], source: str) -> list[dict[str
     return rows
 
 
+def _classify_news_tone(title: str, summary: str) -> tuple[str, str]:
+    tokens = set(re.findall(r"[a-z]+", f"{title} {summary}".lower()))
+    positive_hits = sorted(tokens & POSITIVE_TERMS)
+    negative_hits = sorted(tokens & NEGATIVE_TERMS)
+    if len(positive_hits) > len(negative_hits):
+        return "positive", ", ".join(positive_hits)
+    if len(negative_hits) > len(positive_hits):
+        return "negative", ", ".join(negative_hits)
+    if positive_hits or negative_hits:
+        return "neutral", ", ".join(positive_hits + negative_hits)
+    return "neutral", "no configured keyword matched"
+
+
 def _normalize_news_rows(root: ET.Element, source: str) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for item in root.iter():
@@ -168,14 +308,18 @@ def _normalize_news_rows(root: ET.Element, source: str) -> list[dict[str, Any]]:
             continue
         source_element = _child_element(item, "source")
         publisher = (source_element.text or "").strip() if source_element is not None else source
+        title = html.unescape(_child_text(item, "title"))
+        summary = html.unescape(_child_text(item, "description"))
+        sentiment, sentiment_basis = _classify_news_tone(title, summary)
         rows.append(
             {
                 "published_at": _child_text(item, "pubDate"),
-                "title": html.unescape(_child_text(item, "title")),
+                "title": title,
                 "source": publisher or source,
                 "url": _child_text(item, "link"),
-                "summary": html.unescape(_child_text(item, "description")),
-                "sentiment": "unclassified",
+                "summary": summary,
+                "sentiment": sentiment,
+                "sentiment_basis": sentiment_basis,
             }
         )
     return rows
@@ -229,14 +373,17 @@ def clean_news(rows: Iterable[dict[str, Any]]) -> tuple[list[dict[str, Any]], di
             duplicate_count += 1
             continue
         seen_keys.add(key)
+        summary = str(row.get("summary", "")).strip()
+        sentiment, sentiment_basis = _classify_news_tone(title, summary)
         cleaned.append(
             {
                 "published_at": published_at,
                 "title": title,
                 "source": str(row.get("source", "unknown")).strip() or "unknown",
                 "url": url,
-                "summary": str(row.get("summary", "")).strip(),
-                "sentiment": str(row.get("sentiment", "unclassified")).strip() or "unclassified",
+                "summary": summary,
+                "sentiment": sentiment,
+                "sentiment_basis": sentiment_basis,
             }
         )
     cleaned.sort(key=lambda item: item["published_at"], reverse=True)
@@ -248,18 +395,136 @@ def clean_news(rows: Iterable[dict[str, Any]]) -> tuple[list[dict[str, Any]], di
     }
 
 
-def filter_prices_by_range(
-    rows: Iterable[dict[str, Any]], start_date: str | None, end_date: str | None
+def clean_financials(rows: Iterable[dict[str, Any]]) -> tuple[list[dict[str, Any]], dict[str, int]]:
+    source_rows = list(rows)
+    candidates: list[dict[str, Any]] = []
+    invalid_count = 0
+    for row in source_rows:
+        try:
+            period_end = _parse_date(str(row.get("period_end", "")), "financial period_end")
+            period_start_value = str(row.get("period_start", "")).strip()
+            period_start = _parse_date(period_start_value, "financial period_start") if period_start_value else ""
+            filed_date = _parse_date(str(row.get("filed_date", "")), "financial filed_date")
+            value = float(row["value"])
+            metric = str(row["metric"]).strip()
+            form = str(row["form"]).strip()
+            if not metric or form not in {"10-K", "10-Q"}:
+                raise ValueError("invalid metric or form")
+        except (KeyError, TypeError, ValueError, PipelineError):
+            invalid_count += 1
+            continue
+        candidates.append(
+            {
+                "period_start": period_start,
+                "period_end": period_end,
+                "filed_date": filed_date,
+                "fiscal_year": row.get("fiscal_year", ""),
+                "fiscal_period": str(row.get("fiscal_period", "")).strip(),
+                "form": form,
+                "metric": metric,
+                "metric_label": str(row.get("metric_label", metric)).strip(),
+                "value": value,
+                "unit": str(row.get("unit", "")).strip(),
+                "accession_number": str(row.get("accession_number", "")).strip(),
+                "source": str(row.get("source", "unknown")).strip() or "unknown",
+            }
+        )
+    candidates.sort(
+        key=lambda item: (
+            item["metric"],
+            item["period_end"],
+            item["period_start"],
+            item["form"],
+            item["filed_date"],
+        ),
+        reverse=True,
+    )
+    cleaned: list[dict[str, Any]] = []
+    seen_keys: set[tuple[str, str, str, str]] = set()
+    duplicate_count = 0
+    for row in candidates:
+        key = (row["metric"], row["period_start"], row["period_end"], row["form"])
+        if key in seen_keys:
+            duplicate_count += 1
+            continue
+        seen_keys.add(key)
+        cleaned.append(row)
+    cleaned.sort(key=lambda item: (item["period_end"], item["metric"]))
+    return cleaned, {
+        "raw_rows": len(source_rows),
+        "clean_rows": len(cleaned),
+        "duplicates_removed": duplicate_count,
+        "invalid_rows": invalid_count,
+    }
+
+
+def clean_announcements(rows: Iterable[dict[str, Any]]) -> tuple[list[dict[str, Any]], dict[str, int]]:
+    source_rows = list(rows)
+    cleaned: list[dict[str, Any]] = []
+    seen_accessions: set[str] = set()
+    duplicate_count = 0
+    invalid_count = 0
+    for row in source_rows:
+        try:
+            filed_date = _parse_date(str(row.get("filed_date", "")), "announcement filed_date")
+            form = str(row.get("form", "")).strip()
+            accession_number = str(row.get("accession_number", "")).strip()
+            if form not in SEC_FORMS or not accession_number:
+                raise ValueError("invalid form or accession number")
+        except (TypeError, ValueError, PipelineError):
+            invalid_count += 1
+            continue
+        if accession_number in seen_accessions:
+            duplicate_count += 1
+            continue
+        seen_accessions.add(accession_number)
+        report_date = str(row.get("report_date", "")).strip()
+        if report_date:
+            try:
+                report_date = _parse_date(report_date, "announcement report_date")
+            except PipelineError:
+                report_date = ""
+        cleaned.append(
+            {
+                "filed_date": filed_date,
+                "report_date": report_date,
+                "form": form,
+                "title": str(row.get("title", "")).strip() or f"{form} filing",
+                "accession_number": accession_number,
+                "url": str(row.get("url", "")).strip(),
+                "source": str(row.get("source", "unknown")).strip() or "unknown",
+            }
+        )
+    cleaned.sort(key=lambda item: item["filed_date"], reverse=True)
+    return cleaned, {
+        "raw_rows": len(source_rows),
+        "clean_rows": len(cleaned),
+        "duplicates_removed": duplicate_count,
+        "invalid_rows": invalid_count,
+    }
+
+
+def _filter_rows_by_date(
+    rows: Iterable[dict[str, Any]],
+    field_name: str,
+    start_date: str | None,
+    end_date: str | None,
 ) -> tuple[list[dict[str, Any]], int]:
     filtered: list[dict[str, Any]] = []
     excluded_count = 0
     for row in rows:
-        date = row["date"]
-        if (start_date and date < start_date) or (end_date and date > end_date):
+        date = row.get(field_name, "")
+        if not date or (start_date and date < start_date) or (end_date and date > end_date):
             excluded_count += 1
             continue
         filtered.append(row)
     return filtered, excluded_count
+
+
+def filter_prices_by_range(
+    rows: Iterable[dict[str, Any]], start_date: str | None, end_date: str | None
+) -> tuple[list[dict[str, Any]], int]:
+    return _filter_rows_by_date(rows, "date", start_date, end_date)
 
 
 def filter_news_by_range(
@@ -267,22 +532,59 @@ def filter_news_by_range(
 ) -> tuple[list[dict[str, Any]], int]:
     if not start_date and not end_date:
         return list(rows), 0
+    normalized: list[dict[str, Any]] = []
+    for row in rows:
+        copy = dict(row)
+        try:
+            copy["_publication_date"] = parsedate_to_datetime(copy["published_at"]).date().strftime(DATE_FORMAT)
+        except (TypeError, ValueError, IndexError):
+            copy["_publication_date"] = ""
+        normalized.append(copy)
+    filtered, excluded_count = _filter_rows_by_date(normalized, "_publication_date", start_date, end_date)
+    for row in filtered:
+        row.pop("_publication_date", None)
+    return filtered, excluded_count
+
+
+def filter_financials_by_range(
+    rows: Iterable[dict[str, Any]], start_date: str | None, end_date: str | None
+) -> tuple[list[dict[str, Any]], int]:
+    # Financial reporting periods predate the market observation window. Use filing date
+    # as the availability boundary so the latest report available by end_date is retained.
     filtered: list[dict[str, Any]] = []
     excluded_count = 0
     for row in rows:
-        try:
-            publication_date = parsedate_to_datetime(row["published_at"]).date().strftime(DATE_FORMAT)
-        except (TypeError, ValueError, IndexError):
-            excluded_count += 1
-            continue
-        if (start_date and publication_date < start_date) or (end_date and publication_date > end_date):
+        filed_date = row.get("filed_date", "")
+        if not filed_date or (end_date and filed_date > end_date):
             excluded_count += 1
             continue
         filtered.append(row)
     return filtered, excluded_count
 
 
-def fetch_online_prices(symbol: str, start_date: str | None, end_date: str | None, api_key: str, timeout: int) -> tuple[list[dict[str, Any]], str]:
+def filter_announcements_by_range(
+    rows: Iterable[dict[str, Any]], start_date: str | None, end_date: str | None
+) -> tuple[list[dict[str, Any]], int]:
+    return _filter_rows_by_date(rows, "filed_date", start_date, end_date)
+
+
+def _sec_headers(sec_user_agent: str) -> dict[str, str]:
+    if not sec_user_agent or "@" not in sec_user_agent or "\n" in sec_user_agent or "\r" in sec_user_agent:
+        raise PipelineError(
+            "online mode requires a SEC user agent with a contact email via --sec-user-agent or MARKETSIGNAL_SEC_USER_AGENT"
+        )
+    return {"User-Agent": sec_user_agent, "Accept-Encoding": "gzip, deflate"}
+
+
+def fetch_online_prices(
+    symbol: str,
+    start_date: str | None,
+    end_date: str | None,
+    api_key: str,
+    timeout: int,
+    cache_dir: Path,
+    refresh_cache: bool,
+) -> tuple[list[dict[str, Any]], str, str]:
     params = {
         "symbol": symbol,
         "interval": "1day",
@@ -295,21 +597,291 @@ def fetch_online_prices(symbol: str, start_date: str | None, end_date: str | Non
     if end_date:
         params["end_date"] = end_date
     url = f"{TWELVE_DATA_URL}?{urllib.parse.urlencode(params)}"
-    payload = _fetch_json(url, timeout)
+    payload, cache_status = _fetch_json(url, timeout, cache_dir=cache_dir, refresh_cache=refresh_cache)
     if payload.get("status") == "error" or "code" in payload:
         message = payload.get("message", "price source rejected the request")
         raise PipelineError(f"Twelve Data error: {message}")
-    return _normalize_price_rows(payload, "Twelve Data"), url
+    return _normalize_price_rows(payload, "Twelve Data"), _redact_url(url), cache_status
 
 
-def fetch_online_news(symbol: str, timeout: int) -> tuple[list[dict[str, Any]], str]:
+def fetch_online_news(
+    symbol: str,
+    timeout: int,
+    cache_dir: Path,
+    refresh_cache: bool,
+) -> tuple[list[dict[str, Any]], str, str]:
     params = {"s": symbol, "region": "US", "lang": "en-US"}
     url = f"{YAHOO_NEWS_URL}?{urllib.parse.urlencode(params)}"
+    content, cache_status = _fetch_text(url, timeout, cache_dir=cache_dir, refresh_cache=refresh_cache)
     try:
-        root = ET.fromstring(_fetch_text(url, timeout))
+        root = ET.fromstring(content)
     except ET.ParseError as exc:
         raise PipelineError("Yahoo Finance returned invalid RSS/XML") from exc
-    return _normalize_news_rows(root, "Yahoo Finance RSS"), url
+    return _normalize_news_rows(root, "Yahoo Finance RSS"), url, cache_status
+
+
+def _ticker_records(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    if isinstance(payload.get("data"), list):
+        return [record for record in payload["data"] if isinstance(record, dict)]
+    return [record for record in payload.values() if isinstance(record, dict)]
+
+
+def resolve_entity(
+    symbol: str,
+    ticker_payload: dict[str, Any],
+    submissions_payload: dict[str, Any],
+    source: str,
+) -> dict[str, Any]:
+    match = next(
+        (
+            record
+            for record in _ticker_records(ticker_payload)
+            if str(record.get("ticker", "")).upper() == symbol.upper()
+        ),
+        None,
+    )
+    if not match:
+        raise PipelineError(f"SEC ticker mapping did not find symbol: {symbol}")
+    cik = str(match.get("cik_str", match.get("cik", ""))).zfill(10)
+    if not cik.isdigit() or cik == "0000000000":
+        raise PipelineError(f"SEC ticker mapping returned an invalid CIK for symbol: {symbol}")
+    exchanges = submissions_payload.get("exchanges", [])
+    if not isinstance(exchanges, list):
+        exchanges = []
+    return {
+        "symbol": symbol.upper(),
+        "company_name": str(submissions_payload.get("name") or match.get("title") or "unknown"),
+        "cik": cik,
+        "exchange": ", ".join(str(item) for item in exchanges if item) or "not reported",
+        "sic": str(submissions_payload.get("sic", "")),
+        "sic_description": str(submissions_payload.get("sicDescription", "")),
+        "source": source,
+    }
+
+
+def extract_financial_rows(payload: dict[str, Any], source: str, per_metric_limit: int = 20) -> list[dict[str, Any]]:
+    facts = payload.get("facts", {})
+    us_gaap = facts.get("us-gaap", {}) if isinstance(facts, dict) else {}
+    if not isinstance(us_gaap, dict):
+        raise PipelineError("SEC companyfacts payload does not contain us-gaap facts")
+    rows: list[dict[str, Any]] = []
+    for metric, metric_label, candidates in FINANCIAL_CONCEPTS:
+        concept = next(
+            (us_gaap.get(candidate) for candidate in candidates if isinstance(us_gaap.get(candidate), dict)),
+            None,
+        )
+        if not concept:
+            continue
+        units = concept.get("units", {})
+        if not isinstance(units, dict):
+            continue
+        preferred_unit = "USD" if isinstance(units.get("USD"), list) else next(
+            (unit for unit, values in units.items() if isinstance(values, list)), None
+        )
+        if not preferred_unit:
+            continue
+        records = [record for record in units[preferred_unit] if isinstance(record, dict)]
+        records = [record for record in records if str(record.get("form", "")) in {"10-K", "10-Q"}]
+        records.sort(key=lambda item: (str(item.get("end", "")), str(item.get("filed", ""))), reverse=True)
+        for record in records[:per_metric_limit]:
+            rows.append(
+                {
+                    "period_start": record.get("start", ""),
+                    "period_end": record.get("end", ""),
+                    "filed_date": record.get("filed", ""),
+                    "fiscal_year": record.get("fy", ""),
+                    "fiscal_period": record.get("fp", ""),
+                    "form": record.get("form", ""),
+                    "metric": metric,
+                    "metric_label": metric_label,
+                    "value": record.get("val"),
+                    "unit": preferred_unit,
+                    "accession_number": record.get("accn", ""),
+                    "source": source,
+                }
+            )
+    return rows
+
+
+def extract_announcement_rows(
+    submissions_payload: dict[str, Any],
+    cik: str,
+    source: str,
+    limit: int,
+) -> list[dict[str, Any]]:
+    recent = submissions_payload.get("filings", {}).get("recent", {})
+    if not isinstance(recent, dict):
+        raise PipelineError("SEC submissions payload does not contain recent filings")
+    accessions = recent.get("accessionNumber", [])
+    filing_dates = recent.get("filingDate", [])
+    report_dates = recent.get("reportDate", [])
+    forms = recent.get("form", [])
+    documents = recent.get("primaryDocument", [])
+    descriptions = recent.get("primaryDocDescription", [])
+    if not all(
+        isinstance(value, list)
+        for value in (accessions, filing_dates, report_dates, forms, documents, descriptions)
+    ):
+        raise PipelineError("SEC submissions payload has an invalid recent filings shape")
+    rows: list[dict[str, Any]] = []
+    for index, accession in enumerate(accessions):
+        form = str(forms[index]) if index < len(forms) else ""
+        if form not in SEC_FORMS:
+            continue
+        filing_date = filing_dates[index] if index < len(filing_dates) else ""
+        report_date = report_dates[index] if index < len(report_dates) else ""
+        document = documents[index] if index < len(documents) else ""
+        description = descriptions[index] if index < len(descriptions) else ""
+        compact_accession = str(accession).replace("-", "")
+        document_url = ""
+        if document:
+            document_url = f"https://www.sec.gov/Archives/edgar/data/{int(cik)}/{compact_accession}/{document}"
+        rows.append(
+            {
+                "filed_date": filing_date,
+                "report_date": report_date,
+                "form": form,
+                "title": description or f"{form} filing",
+                "accession_number": accession,
+                "url": document_url,
+                "source": source,
+            }
+        )
+    return rows[:limit]
+
+
+def _source_record(
+    dataset: str,
+    provider: str,
+    mode: str,
+    location: str,
+    cache_status: str,
+    quality: dict[str, int] | None,
+    notes: str,
+) -> dict[str, Any]:
+    return {
+        "dataset": dataset,
+        "provider": provider,
+        "mode": mode,
+        "status": "loaded" if quality is None or quality.get("clean_rows", 0) > 0 else "warning",
+        "cache_status": cache_status,
+        "source_location": location,
+        "raw_rows": quality.get("raw_rows", 1) if quality else 1,
+        "clean_rows": quality.get("clean_rows", 1) if quality else 1,
+        "output_rows": quality.get("output_rows", 1) if quality else 1,
+        "notes": notes,
+    }
+
+
+def _safe_divide(numerator: float | None, denominator: float | None) -> float | None:
+    if numerator is None or denominator in {None, 0}:
+        return None
+    return numerator / denominator
+
+
+def build_indicators(
+    prices: list[dict[str, Any]],
+    financials: list[dict[str, Any]],
+    news: list[dict[str, Any]],
+    announcements: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    indicators: list[dict[str, Any]] = []
+
+    def add(category: str, indicator: str, value: float | int | str | None, unit: str, method: str, evidence: str) -> None:
+        if value is not None:
+            indicators.append(
+                {
+                    "category": category,
+                    "indicator": indicator,
+                    "value": value,
+                    "unit": unit,
+                    "method": method,
+                    "evidence": evidence,
+                }
+            )
+
+    if prices:
+        closes = [row["close"] for row in prices]
+        volumes = [row["volume"] for row in prices]
+        add("market", "latest_close", closes[-1], "price", "last clean close", prices[-1]["date"])
+        period_return = _safe_divide(closes[-1] - closes[0], closes[0])
+        add("market", "period_return", period_return * 100 if period_return is not None else None, "%", "(last close / first close - 1) * 100", f"{prices[0]['date']} to {prices[-1]['date']}")
+        add("market", "average_close", sum(closes) / len(closes), "price", "mean of clean closes", f"{len(closes)} records")
+        add("market", "average_volume", sum(volumes) / len(volumes), "shares", "mean of clean volumes", f"{len(volumes)} records")
+        returns = [((closes[index] / closes[index - 1]) - 1) * 100 for index in range(1, len(closes)) if closes[index - 1]]
+        if returns:
+            average_return = sum(returns) / len(returns)
+            variance = sum((value - average_return) ** 2 for value in returns) / len(returns)
+            add("market", "close_return_volatility", variance**0.5, "%", "population standard deviation of close-to-close returns", f"{len(returns)} return observations")
+
+    sentiment_counts = {"positive": 0, "negative": 0, "neutral": 0}
+    for row in news:
+        sentiment_counts[row["sentiment"]] = sentiment_counts.get(row["sentiment"], 0) + 1
+    for sentiment in ("positive", "negative", "neutral"):
+        add("news", f"{sentiment}_news_count", sentiment_counts.get(sentiment, 0), "articles", "rule-based keyword classification", "title and summary retained in 新闻舆情")
+    add("news", "news_tone_balance", sentiment_counts.get("positive", 0) - sentiment_counts.get("negative", 0), "articles", "positive count minus negative count", "rule-based keyword classification")
+    add("announcements", "filing_count", len(announcements), "filings", "count of clean SEC filings", "10-K, 10-Q, and 8-K only")
+
+    latest_by_metric: dict[str, dict[str, Any]] = {}
+    ordered_financials = sorted(
+        financials,
+        key=lambda item: (item["period_end"], item["period_start"], item["filed_date"]),
+        reverse=True,
+    )
+    for row in ordered_financials:
+        latest_by_metric.setdefault(row["metric"], row)
+
+    def matching_period(numerator_metric: str, denominator_metric: str) -> tuple[float | None, str]:
+        denominators = {
+            (row["period_start"], row["period_end"]): row
+            for row in financials
+            if row["metric"] == denominator_metric
+        }
+        numerator_rows = sorted(
+            (row for row in financials if row["metric"] == numerator_metric),
+            key=lambda item: (item["period_end"], item["period_start"], item["filed_date"]),
+            reverse=True,
+        )
+        for numerator_row in numerator_rows:
+            period = (numerator_row["period_start"], numerator_row["period_end"])
+            denominator_row = denominators.get(period)
+            if denominator_row:
+                return _safe_divide(numerator_row["value"], denominator_row["value"]), f"{period[0]} to {period[1]}"
+        return None, "no matching reporting period"
+
+    margin, margin_evidence = matching_period("net_income", "revenue")
+    add("financial", "net_profit_margin", margin * 100 if margin is not None else None, "%", "net income / revenue * 100 for the same reporting period", margin_evidence)
+    current_assets = latest_by_metric.get("current_assets")
+    current_liabilities = latest_by_metric.get("current_liabilities")
+    if current_assets and current_liabilities and current_assets["period_end"] == current_liabilities["period_end"]:
+        add("financial", "current_ratio", _safe_divide(current_assets["value"], current_liabilities["value"]), "ratio", "current assets / current liabilities at the same period end", current_assets["period_end"])
+    cash_margin, cash_evidence = matching_period("operating_cash_flow", "revenue")
+    add("financial", "operating_cash_flow_margin", cash_margin * 100 if cash_margin is not None else None, "%", "operating cash flow / revenue * 100 for the same reporting period", cash_evidence)
+    revenues = sorted(
+        (row for row in financials if row["metric"] == "revenue"),
+        key=lambda item: (item["period_end"], item["period_start"]),
+        reverse=True,
+    )
+    if len(revenues) >= 2 and revenues[0]["period_start"]:
+        latest_duration = (
+            datetime.strptime(revenues[0]["period_end"], DATE_FORMAT)
+            - datetime.strptime(revenues[0]["period_start"], DATE_FORMAT)
+        ).days
+        comparable = None
+        for row in revenues[1:]:
+            if not row["period_start"]:
+                continue
+            duration = (
+                datetime.strptime(row["period_end"], DATE_FORMAT)
+                - datetime.strptime(row["period_start"], DATE_FORMAT)
+            ).days
+            if abs(duration - latest_duration) <= 7:
+                comparable = row
+                break
+        if comparable:
+            change = _safe_divide(revenues[0]["value"] - comparable["value"], comparable["value"])
+            add("financial", "revenue_period_change", change * 100 if change is not None else None, "%", "(latest revenue / prior comparable-duration revenue - 1) * 100", f"{comparable['period_start']} to {comparable['period_end']} compared with {revenues[0]['period_start']} to {revenues[0]['period_end']}")
+    return indicators
 
 
 def _write_table(sheet: Any, headers: list[str], rows: list[list[Any]]) -> None:
@@ -326,7 +898,7 @@ def _write_table(sheet: Any, headers: list[str], rows: list[list[Any]]) -> None:
     for column_cells in sheet.columns:
         column_index = column_cells[0].column
         longest = max(len(str(cell.value or "")) for cell in column_cells)
-        sheet.column_dimensions[get_column_letter(column_index)].width = min(max(longest + 2, 12), 48)
+        sheet.column_dimensions[get_column_letter(column_index)].width = min(max(longest + 2, 12), 52)
     for row in sheet.iter_rows(min_row=2):
         for cell in row:
             cell.alignment = Alignment(vertical="top", wrap_text=True)
@@ -340,9 +912,17 @@ def _add_hyperlinks(sheet: Any, header_name: str) -> None:
         return
     for row in range(2, sheet.max_row + 1):
         cell = sheet.cell(row=row, column=column_index)
-        if cell.value:
-            cell.hyperlink = str(cell.value)
+        if isinstance(cell.value, str) and cell.value.startswith(("https://", "http://")):
+            cell.hyperlink = cell.value
             cell.style = "Hyperlink"
+
+
+def _set_number_format(sheet: Any, header_names: set[str], number_format: str) -> None:
+    headers = [cell.value for cell in sheet[1]]
+    for index, header in enumerate(headers, start=1):
+        if header in header_names:
+            for row in range(2, sheet.max_row + 1):
+                sheet.cell(row=row, column=index).number_format = number_format
 
 
 def _remove_core_properties(output: Path) -> None:
@@ -377,70 +957,104 @@ def build_workbook(
     start_date: str | None,
     end_date: str | None,
     mode: str,
+    entity: dict[str, Any],
     prices: list[dict[str, Any]],
+    financials: list[dict[str, Any]],
     news: list[dict[str, Any]],
-    price_quality: dict[str, int],
-    news_quality: dict[str, int],
-    price_source: str,
-    news_source: str,
+    announcements: list[dict[str, Any]],
+    indicators: list[dict[str, Any]],
+    qualities: dict[str, dict[str, int]],
+    source_records: list[dict[str, Any]],
+    pipeline_status: str,
 ) -> None:
     workbook = Workbook()
     workbook.remove(workbook.active)
     workbook.properties.creator = "MarketSignal Intelligence"
-    workbook.properties.title = "MarketSignal Intelligence stage-one market report"
+    workbook.properties.title = "MarketSignal Intelligence market research report"
 
-    readme = workbook.create_sheet("README")
     readme_rows = [
-        ["symbol", symbol, "Single-stock stage-one run"],
-        ["start_date", start_date or "not specified", "Inclusive request boundary"],
-        ["end_date", end_date or "not specified", "Inclusive request boundary"],
+        ["symbol", symbol, "Single-stock stage-two run"],
+        ["company_name", entity["company_name"], "Resolved from SEC entity data"],
+        ["cik", entity["cik"], "SEC central index key"],
+        ["exchange", entity["exchange"], "Resolved from SEC entity data"],
+        ["start_date", start_date or "not specified", "Inclusive market/news/filing boundary"],
+        ["end_date", end_date or "not specified", "Inclusive market/news/filing boundary"],
         ["mode", mode, "fixture is deterministic; online uses source adapters"],
-        ["price_source", price_source, "Source URL or fixture path"],
-        ["news_source", news_source, "Source URL or fixture path"],
-        ["price_rows", len(prices), "Rows after cleaning"],
-        ["news_rows", len(news), "Rows after cleaning"],
-        ["forecast_status", "not implemented in stage one", "Forecasting is planned for a later stage"],
-        ["limitations", "Financial statements and sentiment scoring are not included", "Do not treat this workbook as investment advice"],
+        ["pipeline_status", pipeline_status, "Review 数据质量 and 数据来源 for details"],
+        ["price_rows", len(prices), "Rows after cleaning and range filtering"],
+        ["financial_rows", len(financials), "Rows after cleaning and availability filtering"],
+        ["news_rows", len(news), "Rows after cleaning and range filtering"],
+        ["announcement_rows", len(announcements), "Rows after cleaning and range filtering"],
+        ["indicator_rows", len(indicators), "Derived market, financial, news, and filing indicators"],
+        ["forecast_status", "not implemented in stage two", "Forecasting is planned for a later stage"],
+        ["limitations", "Rule-based news tone is not investment advice", "Financial data is limited to configured SEC concepts"],
     ]
+    readme = workbook.create_sheet("README")
     _write_table(readme, ["field", "value", "notes"], readme_rows)
 
+    entity_sheet = workbook.create_sheet("主体信息")
+    _write_table(
+        entity_sheet,
+        ["symbol", "company_name", "cik", "exchange", "sic", "sic_description", "source"],
+        [[entity[key] for key in ["symbol", "company_name", "cik", "exchange", "sic", "sic_description", "source"]]],
+    )
+
     price_sheet = workbook.create_sheet("行情数据")
-    price_rows = [
-        [row["date"], row["open"], row["high"], row["low"], row["close"], row["volume"], row["source"]]
-        for row in prices
-    ]
-    _write_table(price_sheet, ["date", "open", "high", "low", "close", "volume", "source"], price_rows)
-    for row in price_sheet.iter_rows(min_row=2, min_col=2, max_col=5):
-        for cell in row:
-            cell.number_format = "0.0000"
-    for cell in price_sheet[1]:
-        if cell.value == "volume":
-            for data_cell in price_sheet.iter_cols(min_col=cell.column, max_col=cell.column, min_row=2):
-                for value_cell in data_cell:
-                    value_cell.number_format = "#,##0"
+    _write_table(
+        price_sheet,
+        ["date", "open", "high", "low", "close", "volume", "source"],
+        [[row[key] for key in ["date", "open", "high", "low", "close", "volume", "source"]] for row in prices],
+    )
+    _set_number_format(price_sheet, {"open", "high", "low", "close"}, "0.0000")
+    _set_number_format(price_sheet, {"volume"}, "#,##0")
+
+    financial_sheet = workbook.create_sheet("财务数据")
+    _write_table(
+        financial_sheet,
+        ["period_start", "period_end", "filed_date", "fiscal_year", "fiscal_period", "form", "metric", "metric_label", "value", "unit", "accession_number", "source"],
+        [[row[key] for key in ["period_start", "period_end", "filed_date", "fiscal_year", "fiscal_period", "form", "metric", "metric_label", "value", "unit", "accession_number", "source"]] for row in financials],
+    )
+    _set_number_format(financial_sheet, {"value"}, "#,##0.00")
 
     news_sheet = workbook.create_sheet("新闻舆情")
-    news_rows = [
-        [row["published_at"], row["title"], row["source"], row["url"], row["summary"], row["sentiment"]]
-        for row in news
-    ]
-    _write_table(news_sheet, ["published_at", "title", "source", "url", "summary", "sentiment"], news_rows)
+    _write_table(
+        news_sheet,
+        ["published_at", "title", "source", "url", "summary", "sentiment", "sentiment_basis"],
+        [[row[key] for key in ["published_at", "title", "source", "url", "summary", "sentiment", "sentiment_basis"]] for row in news],
+    )
     _add_hyperlinks(news_sheet, "url")
 
+    announcement_sheet = workbook.create_sheet("公告数据")
+    _write_table(
+        announcement_sheet,
+        ["filed_date", "report_date", "form", "title", "accession_number", "url", "source"],
+        [[row[key] for key in ["filed_date", "report_date", "form", "title", "accession_number", "url", "source"]] for row in announcements],
+    )
+    _add_hyperlinks(announcement_sheet, "url")
+
+    indicator_sheet = workbook.create_sheet("指标分析")
+    _write_table(
+        indicator_sheet,
+        ["category", "indicator", "value", "unit", "method", "evidence"],
+        [[row[key] for key in ["category", "indicator", "value", "unit", "method", "evidence"]] for row in indicators],
+    )
+    _set_number_format(indicator_sheet, {"value"}, "0.0000")
+
+    source_sheet = workbook.create_sheet("数据来源")
+    _write_table(
+        source_sheet,
+        ["dataset", "provider", "mode", "status", "cache_status", "source_location", "raw_rows", "clean_rows", "output_rows", "notes"],
+        [[record[key] for key in ["dataset", "provider", "mode", "status", "cache_status", "source_location", "raw_rows", "clean_rows", "output_rows", "notes"]] for record in source_records],
+    )
+    _add_hyperlinks(source_sheet, "source_location")
+
+    quality_rows: list[list[Any]] = []
+    for dataset in ("prices", "financials", "news", "announcements"):
+        quality = qualities[dataset]
+        for metric in ("raw_rows", "clean_rows", "output_rows", "duplicates_removed", "invalid_rows", "out_of_range"):
+            quality_rows.append([dataset, metric, quality[metric], "processing quality metric"])
+    quality_rows.append(["pipeline", "status", pipeline_status, "warning means one or more required datasets have no clean rows"])
     quality_sheet = workbook.create_sheet("数据质量")
-    quality_rows = [
-        ["prices", "raw_rows", price_quality["raw_rows"], "rows received from source"],
-        ["prices", "clean_rows", price_quality["clean_rows"], "rows written to workbook"],
-        ["prices", "duplicates_removed", price_quality["duplicates_removed"], "duplicate dates removed"],
-        ["prices", "invalid_rows", price_quality["invalid_rows"], "invalid rows discarded"],
-        ["prices", "out_of_range", price_quality["out_of_range"], "rows outside request boundaries"],
-        ["news", "raw_rows", news_quality["raw_rows"], "rows received from source"],
-        ["news", "clean_rows", news_quality["clean_rows"], "rows written to workbook"],
-        ["news", "duplicates_removed", news_quality["duplicates_removed"], "duplicate records removed"],
-        ["news", "invalid_rows", news_quality["invalid_rows"], "invalid rows discarded"],
-        ["news", "out_of_range", news_quality["out_of_range"], "rows outside request boundaries"],
-        ["pipeline", "status", "pass" if prices and news else "warning", "warning means a source returned no clean rows"],
-    ]
     _write_table(quality_sheet, ["dataset", "metric", "value", "notes"], quality_rows)
 
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -457,59 +1071,156 @@ def run_pipeline(
     output: Path,
     prices_fixture: Path = DEFAULT_PRICES_FIXTURE,
     news_fixture: Path = DEFAULT_NEWS_FIXTURE,
+    entity_fixture: Path = DEFAULT_ENTITY_FIXTURE,
+    financials_fixture: Path = DEFAULT_FINANCIALS_FIXTURE,
+    submissions_fixture: Path = DEFAULT_SUBMISSIONS_FIXTURE,
     api_key: str | None = None,
+    sec_user_agent: str | None = None,
+    cache_dir: Path = DEFAULT_CACHE_DIR,
+    refresh_cache: bool = False,
+    announcement_limit: int = 40,
     timeout: int = 20,
 ) -> dict[str, Any]:
-    _validate_request(symbol, start_date, end_date, mode, output)
+    _validate_request(symbol, start_date, end_date, mode, output, announcement_limit)
+    normalized_symbol = symbol.upper()
+    source_records: list[dict[str, Any]] = []
+
     if mode == "fixture":
         price_payload = _load_json(prices_fixture)
         news_root = _load_xml(news_fixture)
-        raw_prices = _normalize_price_rows(price_payload, f"fixture:{prices_fixture}")
-        raw_news = _normalize_news_rows(news_root, f"fixture:{news_fixture}")
-        price_source = f"fixture:{prices_fixture}"
-        news_source = f"fixture:{news_fixture}"
+        ticker_payload = _load_json(entity_fixture)
+        financials_payload = _load_json(financials_fixture)
+        submissions_payload = _load_json(submissions_fixture)
+        price_location = _fixture_location(prices_fixture)
+        news_location = _fixture_location(news_fixture)
+        entity_location = _fixture_location(entity_fixture)
+        financial_location = _fixture_location(financials_fixture)
+        announcement_location = _fixture_location(submissions_fixture)
+        cache_status = "not_applicable"
+        price_cache = news_cache = entity_cache = financial_cache = announcement_cache = cache_status
+        raw_prices = _normalize_price_rows(price_payload, "fixture:prices")
+        raw_news = _normalize_news_rows(news_root, "fixture:news")
+        entity = resolve_entity(normalized_symbol, ticker_payload, submissions_payload, "fixture:SEC entity data")
+        raw_financials = extract_financial_rows(financials_payload, "fixture:SEC companyfacts")
+        raw_announcements = extract_announcement_rows(submissions_payload, entity["cik"], "fixture:SEC submissions", announcement_limit)
     else:
         key = api_key or os.environ.get("MARKETSIGNAL_TWELVE_DATA_API_KEY")
         if not key:
             raise PipelineError("online mode requires --twelve-data-api-key or MARKETSIGNAL_TWELVE_DATA_API_KEY")
-        raw_prices, price_source = fetch_online_prices(symbol, start_date, end_date, key, timeout)
-        raw_news, news_source = fetch_online_news(symbol, timeout)
+        sec_identity = sec_user_agent or os.environ.get("MARKETSIGNAL_SEC_USER_AGENT")
+        sec_headers = _sec_headers(sec_identity or "")
+        raw_prices, price_location, price_cache = fetch_online_prices(
+            normalized_symbol, start_date, end_date, key, timeout, cache_dir, refresh_cache
+        )
+        raw_news, news_location, news_cache = fetch_online_news(normalized_symbol, timeout, cache_dir, refresh_cache)
+        ticker_payload, entity_cache = _fetch_json(
+            SEC_TICKERS_URL,
+            timeout,
+            headers=sec_headers,
+            cache_dir=cache_dir,
+            refresh_cache=refresh_cache,
+            is_sec_request=True,
+        )
+        match = next(
+            (record for record in _ticker_records(ticker_payload) if str(record.get("ticker", "")).upper() == normalized_symbol),
+            None,
+        )
+        if not match:
+            raise PipelineError(f"SEC ticker mapping did not find symbol: {normalized_symbol}")
+        cik = str(match.get("cik_str", match.get("cik", ""))).zfill(10)
+        submissions_url = f"{SEC_SUBMISSIONS_URL}/CIK{cik}.json"
+        submissions_payload, announcement_cache = _fetch_json(
+            submissions_url,
+            timeout,
+            headers=sec_headers,
+            cache_dir=cache_dir,
+            refresh_cache=refresh_cache,
+            is_sec_request=True,
+        )
+        entity = resolve_entity(normalized_symbol, ticker_payload, submissions_payload, "SEC EDGAR")
+        facts_url = f"{SEC_COMPANYFACTS_URL}/CIK{entity['cik']}.json"
+        financials_payload, financial_cache = _fetch_json(
+            facts_url,
+            timeout,
+            headers=sec_headers,
+            cache_dir=cache_dir,
+            refresh_cache=refresh_cache,
+            is_sec_request=True,
+        )
+        raw_financials = extract_financial_rows(financials_payload, "SEC companyfacts")
+        raw_announcements = extract_announcement_rows(submissions_payload, entity["cik"], "SEC submissions", announcement_limit)
+        entity_location = SEC_TICKERS_URL
+        financial_location = facts_url
+        announcement_location = submissions_url
 
     prices, price_quality = clean_prices(raw_prices)
+    financials, financial_quality = clean_financials(raw_financials)
     news, news_quality = clean_news(raw_news)
+    announcements, announcement_quality = clean_announcements(raw_announcements)
     prices, price_quality["out_of_range"] = filter_prices_by_range(prices, start_date, end_date)
+    financials, financial_quality["out_of_range"] = filter_financials_by_range(financials, start_date, end_date)
     news, news_quality["out_of_range"] = filter_news_by_range(news, start_date, end_date)
-    if mode == "online" and not prices:
-        raise PipelineError("online price source returned no valid rows")
-    if mode == "online" and not news:
-        raise PipelineError("online news source returned no valid rows")
+    announcements, announcement_quality["out_of_range"] = filter_announcements_by_range(announcements, start_date, end_date)
+    price_quality["output_rows"] = len(prices)
+    financial_quality["output_rows"] = len(financials)
+    news_quality["output_rows"] = len(news)
+    announcement_quality["output_rows"] = len(announcements)
+
+    source_records.extend(
+        [
+            _source_record("prices", "Twelve Data" if mode == "online" else "fixture", mode, price_location, price_cache, price_quality, "daily OHLCV data"),
+            _source_record("news", "Yahoo Finance RSS" if mode == "online" else "fixture", mode, news_location, news_cache, news_quality, "news headlines and source text"),
+            _source_record("entity", "SEC EDGAR" if mode == "online" else "fixture", mode, entity_location, entity_cache, None, "symbol-to-CIK mapping and entity attributes"),
+            _source_record("financials", "SEC companyfacts" if mode == "online" else "fixture", mode, financial_location, financial_cache, financial_quality, "configured US-GAAP concepts from 10-K and 10-Q filings"),
+            _source_record("announcements", "SEC submissions" if mode == "online" else "fixture", mode, announcement_location, announcement_cache, announcement_quality, "10-K, 10-Q, and 8-K filing history"),
+        ]
+    )
+
+    required_sets = {"prices": prices, "financials": financials, "news": news}
+    pipeline_status = "pass" if all(required_sets.values()) else "warning"
+    indicators = build_indicators(prices, financials, news, announcements)
+    qualities = {
+        "prices": price_quality,
+        "financials": financial_quality,
+        "news": news_quality,
+        "announcements": announcement_quality,
+    }
     build_workbook(
         output,
-        symbol,
+        normalized_symbol,
         start_date,
         end_date,
         mode,
+        entity,
         prices,
+        financials,
         news,
-        price_quality,
-        news_quality,
-        price_source,
-        news_source,
+        announcements,
+        indicators,
+        qualities,
+        source_records,
+        pipeline_status,
     )
     return {
-        "symbol": symbol,
+        "symbol": normalized_symbol,
+        "company_name": entity["company_name"],
         "mode": mode,
         "output": str(output),
         "price_rows": len(prices),
+        "financial_rows": len(financials),
         "news_rows": len(news),
+        "announcement_rows": len(announcements),
+        "indicator_rows": len(indicators),
+        "qualities": qualities,
+        # Keep stage-one summary keys available to existing callers.
         "price_quality": price_quality,
         "news_quality": news_quality,
-        "status": "pass" if prices and news else "warning",
+        "status": pipeline_status,
     }
 
 
 def _build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Collect market and news data into a traceable Excel workbook")
+    parser = argparse.ArgumentParser(description="Collect market, financial, news, and filing data into a traceable Excel workbook")
     parser.add_argument("--symbol", required=True, help="single stock symbol")
     parser.add_argument("--start-date", help="inclusive YYYY-MM-DD date")
     parser.add_argument("--end-date", help="inclusive YYYY-MM-DD date")
@@ -517,7 +1228,14 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output", required=True, type=Path, help=".xlsx output path")
     parser.add_argument("--prices-fixture", type=Path, default=DEFAULT_PRICES_FIXTURE)
     parser.add_argument("--news-fixture", type=Path, default=DEFAULT_NEWS_FIXTURE)
+    parser.add_argument("--entity-fixture", type=Path, default=DEFAULT_ENTITY_FIXTURE)
+    parser.add_argument("--financials-fixture", type=Path, default=DEFAULT_FINANCIALS_FIXTURE)
+    parser.add_argument("--submissions-fixture", type=Path, default=DEFAULT_SUBMISSIONS_FIXTURE)
     parser.add_argument("--twelve-data-api-key")
+    parser.add_argument("--sec-user-agent", help="organization or application name plus a contact email")
+    parser.add_argument("--cache-dir", type=Path, default=DEFAULT_CACHE_DIR)
+    parser.add_argument("--refresh-cache", action="store_true")
+    parser.add_argument("--announcement-limit", type=int, default=40)
     parser.add_argument("--timeout", type=int, default=20)
     return parser
 
@@ -534,7 +1252,14 @@ def main(argv: list[str] | None = None) -> int:
             output=args.output,
             prices_fixture=args.prices_fixture,
             news_fixture=args.news_fixture,
+            entity_fixture=args.entity_fixture,
+            financials_fixture=args.financials_fixture,
+            submissions_fixture=args.submissions_fixture,
             api_key=args.twelve_data_api_key,
+            sec_user_agent=args.sec_user_agent,
+            cache_dir=args.cache_dir,
+            refresh_cache=args.refresh_cache,
+            announcement_limit=args.announcement_limit,
             timeout=args.timeout,
         )
     except PipelineError as exc:
