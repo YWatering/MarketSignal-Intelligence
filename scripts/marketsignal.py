@@ -1,13 +1,16 @@
 #!/usr/bin/env python3
-"""MarketSignal Intelligence stage-two collection, governance, analysis, and Excel export."""
+"""MarketSignal Intelligence multi-market collection, governance, analysis, and Excel export."""
 
 from __future__ import annotations
 
 import argparse
+import contextlib
 import gzip
 import hashlib
 import html
+import io
 import json
+import math
 import os
 import re
 import ssl
@@ -47,6 +50,30 @@ SEC_SUBMISSIONS_URL = "https://data.sec.gov/submissions"
 USER_AGENT = "MarketSignal-Intelligence/0.2"
 DATE_FORMAT = "%Y-%m-%d"
 SEC_FORMS = {"10-K", "10-Q", "8-K"}
+CHINA_MARKETS = {"cn_a", "cn_b", "hk"}
+FINANCIAL_FORMS = SEC_FORMS | {"年报", "中报", "一季报", "三季报", "年度", "半年报", "季度", "报告期"}
+ANNOUNCEMENT_FORMS = SEC_FORMS | {"公告", "公告通知"}
+MARKET_ALIASES = {
+    "a": "cn_a",
+    "a股": "cn_a",
+    "cn_a": "cn_a",
+    "b": "cn_b",
+    "b股": "cn_b",
+    "cn_b": "cn_b",
+    "hk": "hk",
+    "港股": "hk",
+    "hongkong": "hk",
+    "us": "us",
+    "美股": "us",
+}
+MARKET_NAMES = {
+    "cn_a": "中国A股",
+    "cn_b": "中国B股",
+    "hk": "中国香港股票",
+    "us": "美国股票",
+}
+MARKET_CURRENCIES = {"cn_a": "CNY", "hk": "HKD", "us": "USD"}
+AKSHARE_DOC_URL = "https://akshare.akfamily.xyz/"
 
 FINANCIAL_CONCEPTS = [
     ("revenue", "Revenue", ["RevenueFromContractWithCustomerExcludingAssessedTax", "SalesRevenueNet"]),
@@ -85,10 +112,145 @@ NEGATIVE_TERMS = {
     "warning",
     "weak",
 }
+POSITIVE_CN_TERMS = {
+    "增长",
+    "上涨",
+    "盈利",
+    "利好",
+    "回购",
+    "创新高",
+    "强劲",
+    "增持",
+    "改善",
+    "突破",
+    "超预期",
+    "扩张",
+    "创纪录",
+}
+NEGATIVE_CN_TERMS = {
+    "下降",
+    "下跌",
+    "亏损",
+    "利空",
+    "减持",
+    "风险",
+    "诉讼",
+    "调查",
+    "预警",
+    "下滑",
+    "不及预期",
+    "处罚",
+    "暴跌",
+    "违约",
+}
 
 
 class PipelineError(RuntimeError):
     """Expected user-facing pipeline failure."""
+
+
+def _normalize_market(value: str | None) -> str | None:
+    if value is None:
+        return None
+    normalized = value.strip().lower()
+    if not normalized:
+        return None
+    market = MARKET_ALIASES.get(normalized)
+    if not market:
+        raise PipelineError(f"unsupported market: {value}; use cn_a, cn_b, hk, or us")
+    return market
+
+
+def _china_exchange_for_code(code: str, suffix: str | None = None) -> str:
+    if suffix in {"SH", "SS"} or code.startswith(("5", "6", "9")):
+        return "SH"
+    if suffix == "BJ" or code.startswith(("4", "8")):
+        return "BJ"
+    return "SZ"
+
+
+def parse_symbol(symbol: str, market: str | None = None) -> dict[str, str]:
+    raw = str(symbol or "").strip().upper()
+    if not raw:
+        raise PipelineError("symbol must be a non-empty value")
+    selected_market = _normalize_market(market)
+    exchange_hint: str | None = None
+    if ":" in raw:
+        prefix, raw = raw.split(":", 1)
+        prefix_market = {"A": "cn_a", "B": "cn_b", "HK": "hk", "NYSE": "us", "NASDAQ": "us"}.get(prefix)
+        if selected_market and prefix_market and selected_market != prefix_market:
+            raise PipelineError(f"symbol prefix {prefix} conflicts with market {selected_market}")
+        selected_market = selected_market or prefix_market
+    suffix_match = re.fullmatch(r"(.+)\.(SH|SS|SZ|BJ|HK|US)", raw)
+    if suffix_match:
+        raw, suffix = suffix_match.groups()
+        suffix_market = "hk" if suffix == "HK" else "us" if suffix == "US" else None
+        if selected_market and suffix_market and selected_market != suffix_market:
+            raise PipelineError(f"symbol suffix .{suffix} conflicts with market {selected_market}")
+        selected_market = selected_market or suffix_market
+        exchange_hint = "SH" if suffix == "SS" else suffix
+    prefix_match = re.fullmatch(r"(SH|SZ|BJ|HK)([A-Z0-9.]+)", raw)
+    if prefix_match:
+        prefix, raw = prefix_match.groups()
+        selected_market = selected_market or ("hk" if prefix == "HK" else "cn_b" if raw.startswith(("900", "200")) else "cn_a")
+        exchange_hint = prefix
+    if selected_market == "hk" or (selected_market is None and raw.isdigit() and 4 <= len(raw) <= 5):
+        if not raw.isdigit() or len(raw) > 5 or exchange_hint not in {None, "HK"}:
+            raise PipelineError("Hong Kong symbols must be one to five digits, such as 00700 or 00700.HK")
+        code = raw.zfill(5)
+        return {
+            "symbol": f"{code}.HK",
+            "code": code,
+            "provider_symbol": code,
+            "financial_symbol": code,
+            "market": "hk",
+            "market_name": MARKET_NAMES["hk"],
+            "exchange": "HKEX",
+            "exchange_prefix": "HK",
+            "currency": MARKET_CURRENCIES["hk"],
+        }
+    if selected_market in {"cn_a", "cn_b"} or (selected_market is None and raw.isdigit() and len(raw) == 6):
+        if not raw.isdigit() or len(raw) != 6:
+            raise PipelineError("Chinese A/B-share symbols must be six digits, such as 600519 or 900901")
+        inferred_exchange = _china_exchange_for_code(raw)
+        exchange = exchange_hint or inferred_exchange
+        if exchange not in {"SH", "SZ", "BJ"}:
+            raise PipelineError("Chinese A/B-share symbols must use .SH, .SZ, or .BJ exchange suffixes")
+        if exchange != inferred_exchange:
+            raise PipelineError(f"symbol {raw} does not match exchange {exchange}")
+        inferred_market = "cn_b" if raw.startswith(("900", "200")) else "cn_a"
+        selected_market = selected_market or inferred_market
+        if selected_market == "cn_b" and not raw.startswith(("900", "200")):
+            raise PipelineError("B-share symbols must start with 900 (Shanghai) or 200 (Shenzhen)")
+        if selected_market == "cn_a" and raw.startswith(("900", "200")):
+            raise PipelineError("900xxx and 200xxx symbols are B shares; use market cn_b")
+        currency = "USD" if selected_market == "cn_b" and exchange == "SH" else "HKD" if selected_market == "cn_b" else MARKET_CURRENCIES[selected_market]
+        return {
+            "symbol": f"{raw}.{exchange}",
+            "code": raw,
+            "provider_symbol": raw,
+            "financial_symbol": f"{exchange}{raw}",
+            "market": selected_market,
+            "market_name": MARKET_NAMES[selected_market],
+            "exchange": {"SH": "SSE", "SZ": "SZSE", "BJ": "BSE"}[exchange],
+            "exchange_prefix": exchange,
+            "currency": currency,
+        }
+    if selected_market not in {None, "us"}:
+        raise PipelineError(f"symbol {symbol} is not valid for market {selected_market}")
+    if not re.fullmatch(r"[A-Z][A-Z0-9.\-]{0,15}", raw):
+        raise PipelineError("US symbols must contain letters, numbers, dots, or hyphens")
+    return {
+        "symbol": raw,
+        "code": raw,
+        "provider_symbol": raw,
+        "financial_symbol": raw,
+        "market": "us",
+        "market_name": MARKET_NAMES["us"],
+        "exchange": "US market",
+        "exchange_prefix": "US",
+        "currency": MARKET_CURRENCIES["us"],
+    }
 
 
 def _parse_date(value: str, field_name: str) -> str:
@@ -265,7 +427,67 @@ def _fixture_location(path: Path) -> str:
         return f"fixture:{path}"
 
 
-def _normalize_price_rows(payload: dict[str, Any], source: str) -> list[dict[str, Any]]:
+def _text_value(value: Any) -> str:
+    if value is None:
+        return ""
+    try:
+        if bool(math.isnan(value)):
+            return ""
+    except (TypeError, ValueError):
+        pass
+    if hasattr(value, "to_pydatetime"):
+        value = value.to_pydatetime()
+    if isinstance(value, datetime):
+        return value.strftime("%Y-%m-%d %H:%M:%S")
+    return str(value).strip()
+
+
+def _date_value(value: Any) -> str:
+    text = _text_value(value)
+    match = re.match(r"(\d{4}-\d{2}-\d{2})", text)
+    return match.group(1) if match else text
+
+
+def _number_value(value: Any) -> float | None:
+    if value is None:
+        return None
+    try:
+        if bool(math.isnan(value)):
+            return None
+    except (TypeError, ValueError):
+        pass
+    text = _text_value(value).replace(",", "").replace("%", "")
+    if not text or text in {"-", "--", "N/A", "nan", "None"}:
+        return None
+    try:
+        number = float(text)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+def _pick_value(row: dict[str, Any], names: Iterable[str]) -> Any:
+    for name in names:
+        if name in row and _number_value(row[name]) is not None:
+            return row[name]
+    return None
+
+
+def _dataframe_records(frame: Any) -> list[dict[str, Any]]:
+    if frame is None:
+        return []
+    if isinstance(frame, list):
+        return [row for row in frame if isinstance(row, dict)]
+    try:
+        records = frame.to_dict(orient="records")
+    except (AttributeError, TypeError):
+        return []
+    return [row for row in records if isinstance(row, dict)]
+
+
+def _normalize_price_rows(
+    payload: dict[str, Any], source: str, market: str = "us", currency: str = "USD"
+) -> list[dict[str, Any]]:
     values = payload.get("values")
     if not isinstance(values, list):
         raise PipelineError("price source payload does not contain a values list")
@@ -283,15 +505,43 @@ def _normalize_price_rows(payload: dict[str, Any], source: str) -> list[dict[str
                 "close": value.get("close"),
                 "volume": value.get("volume"),
                 "source": source,
+                "market": market,
+                "currency": currency,
+            }
+        )
+    return rows
+
+
+def _normalize_dataframe_price_rows(
+    frame: Any, source: str, market: str, currency: str
+) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for record in _dataframe_records(frame):
+        rows.append(
+            {
+                "date": _date_value(record.get("date", record.get("日期", record.get("交易日期", "")))),
+                "open": _number_value(_pick_value(record, ("open", "开盘", "开盘价"))),
+                "high": _number_value(_pick_value(record, ("high", "最高", "最高价"))),
+                "low": _number_value(_pick_value(record, ("low", "最低", "最低价"))),
+                "close": _number_value(_pick_value(record, ("close", "收盘", "收盘价"))),
+                "volume": _number_value(_pick_value(record, ("volume", "成交量"))),
+                "source": source,
+                "market": market,
+                "currency": currency,
             }
         )
     return rows
 
 
 def _classify_news_tone(title: str, summary: str) -> tuple[str, str]:
-    tokens = set(re.findall(r"[a-z]+", f"{title} {summary}".lower()))
+    text = f"{title} {summary}".lower()
+    tokens = set(re.findall(r"[a-z]+", text))
     positive_hits = sorted(tokens & POSITIVE_TERMS)
     negative_hits = sorted(tokens & NEGATIVE_TERMS)
+    positive_cn_hits = sorted(term for term in POSITIVE_CN_TERMS if term in text)
+    negative_cn_hits = sorted(term for term in NEGATIVE_CN_TERMS if term in text)
+    positive_hits.extend(positive_cn_hits)
+    negative_hits.extend(negative_cn_hits)
     if len(positive_hits) > len(negative_hits):
         return "positive", ", ".join(positive_hits)
     if len(negative_hits) > len(positive_hits):
@@ -325,6 +575,28 @@ def _normalize_news_rows(root: ET.Element, source: str) -> list[dict[str, Any]]:
     return rows
 
 
+def _normalize_dataframe_news_rows(frame: Any, source: str, market: str, currency: str) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for record in _dataframe_records(frame):
+        title = _text_value(record.get("新闻标题", record.get("title", record.get("标题", ""))))
+        summary = _text_value(record.get("新闻内容", record.get("summary", record.get("内容", ""))))
+        sentiment, sentiment_basis = _classify_news_tone(title, summary)
+        rows.append(
+            {
+                "published_at": _text_value(record.get("发布时间", record.get("published_at", record.get("date", "")))),
+                "title": title,
+                "source": _text_value(record.get("文章来源", record.get("source", ""))) or source,
+                "url": _text_value(record.get("新闻链接", record.get("url", ""))),
+                "summary": summary,
+                "sentiment": sentiment,
+                "sentiment_basis": sentiment_basis,
+                "market": market,
+                "currency": currency,
+            }
+        )
+    return rows
+
+
 def clean_prices(rows: Iterable[dict[str, Any]]) -> tuple[list[dict[str, Any]], dict[str, int]]:
     source_rows = list(rows)
     cleaned: list[dict[str, Any]] = []
@@ -333,9 +605,17 @@ def clean_prices(rows: Iterable[dict[str, Any]]) -> tuple[list[dict[str, Any]], 
     invalid_count = 0
     for row in source_rows:
         try:
-            date = _parse_date(str(row.get("date", "")), "price date")
-            values = {field: float(row[field]) for field in ("open", "high", "low", "close")}
-            volume = int(float(row["volume"]))
+            date = _parse_date(_date_value(row.get("date", "")), "price date")
+            values = {}
+            for field in ("open", "high", "low", "close"):
+                number = _number_value(row.get(field))
+                if number is None:
+                    raise ValueError(f"invalid {field}")
+                values[field] = number
+            volume_value = _number_value(row.get("volume"))
+            if volume_value is None:
+                raise ValueError("invalid volume")
+            volume = int(volume_value)
             if values["high"] < values["low"] or volume < 0:
                 raise ValueError("invalid price range or volume")
         except (KeyError, TypeError, ValueError, PipelineError):
@@ -345,7 +625,16 @@ def clean_prices(rows: Iterable[dict[str, Any]]) -> tuple[list[dict[str, Any]], 
             duplicate_count += 1
             continue
         seen_dates.add(date)
-        cleaned.append({"date": date, **values, "volume": volume, "source": row.get("source", "unknown")})
+        cleaned.append(
+            {
+                "date": date,
+                **values,
+                "volume": volume,
+                "source": row.get("source", "unknown"),
+                "market": row.get("market", "us"),
+                "currency": row.get("currency", "USD"),
+            }
+        )
     cleaned.sort(key=lambda item: item["date"])
     return cleaned, {
         "raw_rows": len(source_rows),
@@ -384,6 +673,8 @@ def clean_news(rows: Iterable[dict[str, Any]]) -> tuple[list[dict[str, Any]], di
                 "summary": summary,
                 "sentiment": sentiment,
                 "sentiment_basis": sentiment_basis,
+                "market": row.get("market", "us"),
+                "currency": row.get("currency", "USD"),
             }
         )
     cleaned.sort(key=lambda item: item["published_at"], reverse=True)
@@ -401,14 +692,16 @@ def clean_financials(rows: Iterable[dict[str, Any]]) -> tuple[list[dict[str, Any
     invalid_count = 0
     for row in source_rows:
         try:
-            period_end = _parse_date(str(row.get("period_end", "")), "financial period_end")
-            period_start_value = str(row.get("period_start", "")).strip()
+            period_end = _parse_date(_date_value(row.get("period_end", "")), "financial period_end")
+            period_start_value = _date_value(row.get("period_start", ""))
             period_start = _parse_date(period_start_value, "financial period_start") if period_start_value else ""
-            filed_date = _parse_date(str(row.get("filed_date", "")), "financial filed_date")
-            value = float(row["value"])
+            filed_date = _parse_date(_date_value(row.get("filed_date", "")), "financial filed_date")
+            value = _number_value(row["value"])
+            if value is None:
+                raise ValueError("invalid financial value")
             metric = str(row["metric"]).strip()
             form = str(row["form"]).strip()
-            if not metric or form not in {"10-K", "10-Q"}:
+            if not metric or form not in FINANCIAL_FORMS:
                 raise ValueError("invalid metric or form")
         except (KeyError, TypeError, ValueError, PipelineError):
             invalid_count += 1
@@ -427,6 +720,8 @@ def clean_financials(rows: Iterable[dict[str, Any]]) -> tuple[list[dict[str, Any
                 "unit": str(row.get("unit", "")).strip(),
                 "accession_number": str(row.get("accession_number", "")).strip(),
                 "source": str(row.get("source", "unknown")).strip() or "unknown",
+                "market": str(row.get("market", "us")).strip() or "us",
+                "currency": str(row.get("currency", "USD")).strip() or "USD",
             }
         )
     candidates.sort(
@@ -466,10 +761,10 @@ def clean_announcements(rows: Iterable[dict[str, Any]]) -> tuple[list[dict[str, 
     invalid_count = 0
     for row in source_rows:
         try:
-            filed_date = _parse_date(str(row.get("filed_date", "")), "announcement filed_date")
+            filed_date = _parse_date(_date_value(row.get("filed_date", "")), "announcement filed_date")
             form = str(row.get("form", "")).strip()
             accession_number = str(row.get("accession_number", "")).strip()
-            if form not in SEC_FORMS or not accession_number:
+            if form not in ANNOUNCEMENT_FORMS or not accession_number:
                 raise ValueError("invalid form or accession number")
         except (TypeError, ValueError, PipelineError):
             invalid_count += 1
@@ -478,7 +773,7 @@ def clean_announcements(rows: Iterable[dict[str, Any]]) -> tuple[list[dict[str, 
             duplicate_count += 1
             continue
         seen_accessions.add(accession_number)
-        report_date = str(row.get("report_date", "")).strip()
+        report_date = _date_value(row.get("report_date", ""))
         if report_date:
             try:
                 report_date = _parse_date(report_date, "announcement report_date")
@@ -493,6 +788,8 @@ def clean_announcements(rows: Iterable[dict[str, Any]]) -> tuple[list[dict[str, 
                 "accession_number": accession_number,
                 "url": str(row.get("url", "")).strip(),
                 "source": str(row.get("source", "unknown")).strip() or "unknown",
+                "market": str(row.get("market", "us")).strip() or "us",
+                "currency": str(row.get("currency", "USD")).strip() or "USD",
             }
         )
     cleaned.sort(key=lambda item: item["filed_date"], reverse=True)
@@ -536,8 +833,13 @@ def filter_news_by_range(
     for row in rows:
         copy = dict(row)
         try:
-            copy["_publication_date"] = parsedate_to_datetime(copy["published_at"]).date().strftime(DATE_FORMAT)
-        except (TypeError, ValueError, IndexError):
+            publication_text = _text_value(copy.get("published_at", ""))
+            try:
+                publication_date = parsedate_to_datetime(publication_text).date()
+            except (TypeError, ValueError, IndexError):
+                publication_date = datetime.fromisoformat(publication_text.replace("Z", "+00:00")).date()
+            copy["_publication_date"] = publication_date.strftime(DATE_FORMAT)
+        except (TypeError, ValueError, IndexError, OverflowError):
             copy["_publication_date"] = ""
         normalized.append(copy)
     filtered, excluded_count = _filter_rows_by_date(normalized, "_publication_date", start_date, end_date)
@@ -576,6 +878,443 @@ def _sec_headers(sec_user_agent: str) -> dict[str, str]:
     return {"User-Agent": sec_user_agent, "Accept-Encoding": "gzip, deflate"}
 
 
+def _akshare_module() -> Any:
+    try:
+        import akshare as ak
+    except ImportError as exc:
+        raise PipelineError("Chinese-market online mode requires akshare; install requirements.txt first") from exc
+    return ak
+
+
+def _akshare_cache_path(cache_dir: Path | None, key: str) -> Path | None:
+    if cache_dir is None:
+        return None
+    digest = hashlib.sha256(key.encode("utf-8")).hexdigest()
+    return cache_dir / f"akshare-{digest}.json"
+
+
+def _fetch_akshare_table(
+    function_name: str,
+    cache_key: str,
+    loader: Any,
+    cache_dir: Path | None,
+    refresh_cache: bool,
+) -> tuple[Any, str]:
+    cache_file = _akshare_cache_path(cache_dir, cache_key)
+    if cache_file and cache_file.exists() and not refresh_cache:
+        try:
+            import pandas as pd
+
+            payload = json.loads(cache_file.read_text(encoding="utf-8"))
+            return pd.DataFrame(payload["records"], columns=payload["columns"]), "hit"
+        except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise PipelineError(f"AKShare cache is invalid for {function_name}") from exc
+    try:
+        # Several AKShare endpoints use progress output; keep the CLI summary readable.
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            frame = loader()
+    except Exception as exc:
+        raise PipelineError(f"AKShare {function_name} failed: {exc}") from exc
+    if frame is None:
+        try:
+            import pandas as pd
+
+            frame = pd.DataFrame()
+        except ImportError as exc:
+            raise PipelineError("Chinese-market online mode requires pandas through akshare") from exc
+    if cache_file:
+        try:
+            cache_file.parent.mkdir(parents=True, exist_ok=True)
+            payload = {
+                "columns": [str(column) for column in frame.columns],
+                "records": json.loads(frame.to_json(orient="records", date_format="iso", force_ascii=False)),
+            }
+            cache_file.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        except (OSError, TypeError, ValueError) as exc:
+            raise PipelineError(f"could not cache AKShare {function_name} response") from exc
+    return frame, "miss" if cache_file else "disabled"
+
+
+def _combine_cache_status(statuses: Iterable[str]) -> str:
+    values = list(statuses)
+    if not values:
+        return "disabled"
+    if all(value == "hit" for value in values):
+        return "hit"
+    if all(value == "disabled" for value in values):
+        return "disabled"
+    if any(value == "miss" for value in values):
+        return "miss"
+    return "partial"
+
+
+def _date_argument(value: str | None, default: str) -> str:
+    return (value or default).replace("-", "")
+
+
+def _akshare_price_frame(
+    instrument: dict[str, str],
+    start_date: str | None,
+    end_date: str | None,
+    cache_dir: Path | None,
+    refresh_cache: bool,
+) -> tuple[Any, str, str]:
+    ak = _akshare_module()
+    start = _date_argument(start_date, "1970-01-01")
+    end = _date_argument(end_date, "2050-01-01")
+    market = instrument["market"]
+    code = instrument["code"]
+    if market == "cn_a":
+        candidates = [
+            ("stock_zh_a_hist", lambda: ak.stock_zh_a_hist(code, "daily", start, end, "", 20)),
+            (
+                "stock_zh_a_hist_tx",
+                lambda: ak.stock_zh_a_hist_tx(
+                    f"{instrument['exchange_prefix'].lower()}{code}", start, end, ""
+                ),
+            ),
+        ]
+    elif market == "cn_b":
+        candidates = [
+            (
+                "stock_zh_b_daily",
+                lambda: ak.stock_zh_b_daily(
+                    f"{instrument['exchange_prefix'].lower()}{code}", start, end, ""
+                ),
+            )
+        ]
+    else:
+        candidates = [
+            ("stock_hk_hist", lambda: ak.stock_hk_hist(code, "daily", start, end, "")),
+            ("stock_hk_daily", lambda: ak.stock_hk_daily(code, "")),
+        ]
+    errors: list[str] = []
+    for function_name, loader in candidates:
+        try:
+            frame, cache_status = _fetch_akshare_table(
+                function_name,
+                f"price:{market}:{instrument['provider_symbol']}:{start}:{end}:{function_name}",
+                loader,
+                cache_dir,
+                refresh_cache,
+            )
+            if len(frame.index) == 0 and function_name != candidates[-1][0]:
+                errors.append(f"{function_name} returned no rows")
+                continue
+            return frame, cache_status, function_name
+        except PipelineError as exc:
+            errors.append(str(exc))
+    raise PipelineError("; ".join(errors) or f"AKShare has no price adapter for {market}")
+
+
+def fetch_online_china_prices(
+    instrument: dict[str, str],
+    start_date: str | None,
+    end_date: str | None,
+    cache_dir: Path | None,
+    refresh_cache: bool,
+) -> tuple[list[dict[str, Any]], str, str, str]:
+    frame, cache_status, function_name = _akshare_price_frame(
+        instrument, start_date, end_date, cache_dir, refresh_cache
+    )
+    return (
+        _normalize_dataframe_price_rows(frame, f"AKShare {function_name}", instrument["market"], instrument["currency"]),
+        AKSHARE_DOC_URL,
+        cache_status,
+        f"AKShare {function_name}",
+    )
+
+
+def fetch_online_china_news(
+    instrument: dict[str, str],
+    cache_dir: Path | None,
+    refresh_cache: bool,
+) -> tuple[list[dict[str, Any]], str, str, str]:
+    ak = _akshare_module()
+    function_name = "stock_news_em"
+    candidates = list(dict.fromkeys((instrument["code"], instrument["symbol"])))
+    errors: list[str] = []
+    for news_symbol in candidates:
+        try:
+            frame, cache_status = _fetch_akshare_table(
+                function_name,
+                f"news:{instrument['market']}:{news_symbol}",
+                lambda news_symbol=news_symbol: ak.stock_news_em(symbol=news_symbol),
+                cache_dir,
+                refresh_cache,
+            )
+            return (
+                _normalize_dataframe_news_rows(frame, f"AKShare {function_name}", instrument["market"], instrument["currency"]),
+                AKSHARE_DOC_URL,
+                cache_status,
+                f"AKShare {function_name} ({news_symbol})",
+            )
+        except PipelineError as exc:
+            errors.append(str(exc))
+    raise PipelineError("; ".join(errors) or f"AKShare has no news adapter for {instrument['symbol']}")
+
+
+def _china_period_start(period_end: str, report_type: str) -> str:
+    if not period_end:
+        return ""
+    year = period_end[:4]
+    return f"{year}-01-01"
+
+
+def _normalize_china_report_type(value: Any) -> str:
+    report_type = _text_value(value)
+    return {
+        "001": "年度",
+        "002": "一季报",
+        "003": "中报",
+        "004": "三季报",
+        "005": "年报",
+    }.get(report_type, report_type)
+
+
+def _china_financial_row(
+    record: dict[str, Any],
+    metric: str,
+    metric_label: str,
+    value: Any,
+    instrument: dict[str, str],
+    source: str,
+    hong_kong: bool,
+) -> dict[str, Any] | None:
+    period_end = _date_value(record.get("REPORT_DATE", record.get("报告日期", record.get("period_end", ""))))
+    if not period_end:
+        return None
+    period_start = _date_value(record.get("START_DATE", record.get("开始日期", record.get("period_start", ""))))
+    report_type = _normalize_china_report_type(
+        record.get("REPORT_TYPE", record.get("DATE_TYPE_CODE", record.get("报告类型", "")))
+    )
+    if not period_start:
+        period_start = _china_period_start(period_end, report_type)
+    filed_date = _date_value(record.get("NOTICE_DATE", record.get("UPDATE_DATE", record.get("公告日期", ""))))
+    if not filed_date:
+        filed_date = period_end
+    form = report_type or ("年度" if hong_kong else "报告期")
+    number = _number_value(value)
+    if number is None:
+        return None
+    currency = _text_value(record.get("CURRENCY", record.get("货币", ""))) or instrument["currency"]
+    return {
+        "period_start": period_start,
+        "period_end": period_end,
+        "filed_date": filed_date,
+        "fiscal_year": period_end[:4],
+        "fiscal_period": report_type,
+        "form": form,
+        "metric": metric,
+        "metric_label": metric_label,
+        "value": number,
+        "unit": currency,
+        "accession_number": "",
+        "source": source,
+        "market": instrument["market"],
+        "currency": currency,
+    }
+
+
+def _append_china_metric(
+    rows: list[dict[str, Any]],
+    record: dict[str, Any],
+    instrument: dict[str, str],
+    source: str,
+    hong_kong: bool,
+    metric: str,
+    metric_label: str,
+    aliases: Iterable[str],
+) -> None:
+    value = None
+    if hong_kong:
+        item_name = _text_value(record.get("STD_ITEM_NAME", ""))
+        if any(alias in item_name for alias in aliases):
+            value = record.get("AMOUNT")
+    else:
+        value = _pick_value(record, aliases)
+    row = _china_financial_row(record, metric, metric_label, value, instrument, source, hong_kong)
+    if row:
+        rows.append(row)
+
+
+def extract_china_financial_rows(
+    tables: dict[str, Any], instrument: dict[str, str], source_prefix: str = "AKShare"
+) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    hong_kong = instrument["market"] == "hk"
+    metrics = {
+        "profit": [
+            ("revenue", "营业收入", ("TOTAL_OPERATE_INCOME", "OPERATE_INCOME", "营业总收入", "营业额", "营运收入", "经营收入总额")),
+            ("net_income", "净利润", ("PARENT_NETPROFIT", "NETPROFIT", "股东应占溢利", "股东应占利润", "除税后溢利")),
+        ],
+        "balance": [
+            ("assets", "总资产", ("TOTAL_ASSETS", "ASSET_BALANCE", "资产总额", "资产总值")),
+            ("liabilities", "总负债", ("TOTAL_LIABILITIES", "LIAB_BALANCE", "负债总额", "负债总值")),
+            ("current_assets", "流动资产", ("TOTAL_CURRENT_ASSETS", "CURRENT_ASSET_BALANCE", "流动资产总额", "流动资产")),
+            ("current_liabilities", "流动负债", ("TOTAL_CURRENT_LIAB", "CURRENT_LIAB_BALANCE", "流动负债总额", "流动负债")),
+            ("cash_and_equivalents", "现金及现金等价物", ("MONETARYFUNDS", "现金及现金等价物", "现金和现金等价物")),
+        ],
+        "cash": [
+            ("operating_cash_flow", "经营活动现金流", ("NETCASH_OPERATE", "经营活动产生的现金流量净额", "经营现金流", "经营活动现金净额")),
+        ],
+    }
+    for table_name, table in tables.items():
+        source = f"{source_prefix} {table_name}"
+        for record in _dataframe_records(table):
+            for metric, label, aliases in metrics.get(table_name, []):
+                _append_china_metric(rows, record, instrument, source, hong_kong, metric, label, aliases)
+    return rows
+
+
+def _entity_name_from_tables(tables: dict[str, Any]) -> str:
+    for table in tables.values():
+        for record in _dataframe_records(table):
+            for key in ("SECURITY_NAME_ABBR", "证券简称", "SECURITY_NAME", "名称"):
+                name = _text_value(record.get(key, ""))
+                if name:
+                    return name
+    return "unknown"
+
+
+def _entity_name_from_profile(frame: Any) -> str:
+    for record in _dataframe_records(frame):
+        for key in ("公司名称", "证券简称", "公司简称"):
+            name = _text_value(record.get(key, ""))
+            if name:
+                return name
+    return ""
+
+
+def resolve_china_entity(instrument: dict[str, str], tables: dict[str, Any], profile: Any = None) -> dict[str, str]:
+    return {
+        "symbol": instrument["symbol"],
+        "provider_symbol": instrument["provider_symbol"],
+        "market": instrument["market"],
+        "market_name": instrument["market_name"],
+        "company_name": _entity_name_from_profile(profile) or _entity_name_from_tables(tables),
+        "cik": "",
+        "exchange": instrument["exchange"],
+        "sic": "",
+        "sic_description": "",
+        "currency": instrument["currency"],
+        "source": "AKShare",
+    }
+
+
+def fetch_online_china_financials(
+    instrument: dict[str, str],
+    cache_dir: Path | None,
+    refresh_cache: bool,
+) -> tuple[list[dict[str, Any]], dict[str, str], str, str, str, str]:
+    ak = _akshare_module()
+    statuses: list[str] = []
+    tables: dict[str, Any] = {}
+    if instrument["market"] in {"cn_a", "cn_b"}:
+        symbol = instrument["financial_symbol"]
+        specs = {
+            "profit": "stock_profit_sheet_by_report_em",
+            "balance": "stock_balance_sheet_by_report_em",
+            "cash": "stock_cash_flow_sheet_by_report_em",
+        }
+        for table_name, function_name in specs.items():
+            frame, status = _fetch_akshare_table(
+                function_name,
+                f"financial:{instrument['market']}:{instrument['provider_symbol']}:{table_name}",
+                lambda function_name=function_name: getattr(ak, function_name)(symbol=symbol),
+                cache_dir,
+                refresh_cache,
+            )
+            tables[table_name] = frame
+            statuses.append(status)
+        profile = None
+        entity = resolve_china_entity(instrument, tables)
+        source_prefix = "AKShare"
+    else:
+        specs = {"profit": "利润表", "balance": "资产负债表", "cash": "现金流量表"}
+        for table_name, statement_name in specs.items():
+            frame, status = _fetch_akshare_table(
+                "stock_financial_hk_report_em",
+                f"financial:{instrument['market']}:{instrument['provider_symbol']}:{table_name}",
+                lambda statement_name=statement_name: ak.stock_financial_hk_report_em(
+                    stock=instrument["code"], symbol=statement_name, indicator="年度"
+                ),
+                cache_dir,
+                refresh_cache,
+            )
+            tables[table_name] = frame
+            statuses.append(status)
+        profile, profile_status = _fetch_akshare_table(
+            "stock_hk_security_profile_em",
+            f"entity:{instrument['market']}:{instrument['provider_symbol']}",
+            lambda: ak.stock_hk_security_profile_em(symbol=instrument["code"]),
+            cache_dir,
+            refresh_cache,
+        )
+        statuses.append(profile_status)
+        entity = resolve_china_entity(instrument, tables, profile)
+        source_prefix = "AKShare"
+    return (
+        extract_china_financial_rows(tables, instrument, source_prefix),
+        entity,
+        AKSHARE_DOC_URL,
+        _combine_cache_status(statuses),
+        "AKShare stock financial statement adapters",
+        "annual/report-period Chinese-market financial statements",
+    )
+
+
+def fetch_online_china_announcements(
+    instrument: dict[str, str],
+    start_date: str | None,
+    end_date: str | None,
+    cache_dir: Path | None,
+    refresh_cache: bool,
+) -> tuple[list[dict[str, Any]], str, str, str]:
+    if instrument["market"] == "hk":
+        return [], AKSHARE_DOC_URL, "not_supported", "No dedicated HK notice adapter in this stage"
+    ak = _akshare_module()
+    function_name = "stock_individual_notice_report"
+    try:
+        frame, cache_status = _fetch_akshare_table(
+            function_name,
+            f"announcements:{instrument['market']}:{instrument['provider_symbol']}:{start_date}:{end_date}",
+            lambda: ak.stock_individual_notice_report(
+                security=instrument["code"],
+                symbol="全部",
+                begin_date=_date_argument(start_date, "1970-01-01"),
+                end_date=_date_argument(end_date, "2050-01-01"),
+            ),
+            cache_dir,
+            refresh_cache,
+        )
+    except PipelineError as exc:
+        if instrument["market"] == "cn_b":
+            return [], AKSHARE_DOC_URL, "not_supported", f"B-share notice endpoint returned no usable rows: {exc}"
+        raise
+    rows: list[dict[str, Any]] = []
+    for index, record in enumerate(_dataframe_records(frame)):
+        filed_date = _date_value(record.get("公告日期", record.get("date", "")))
+        title = _text_value(record.get("公告标题", record.get("title", "")))
+        url = _text_value(record.get("网址", record.get("url", "")))
+        if not filed_date or not title:
+            continue
+        rows.append(
+            {
+                "filed_date": filed_date,
+                "report_date": filed_date,
+                "form": "公告",
+                "title": title,
+                "accession_number": url or f"{instrument['symbol']}:{filed_date}:{index}",
+                "url": url,
+                "source": f"AKShare {function_name}",
+                "market": instrument["market"],
+                "currency": instrument["currency"],
+            }
+        )
+    return rows, AKSHARE_DOC_URL, cache_status, f"AKShare {function_name}"
+
+
 def fetch_online_prices(
     symbol: str,
     start_date: str | None,
@@ -584,6 +1323,8 @@ def fetch_online_prices(
     timeout: int,
     cache_dir: Path,
     refresh_cache: bool,
+    market: str = "us",
+    currency: str = "USD",
 ) -> tuple[list[dict[str, Any]], str, str]:
     params = {
         "symbol": symbol,
@@ -601,7 +1342,7 @@ def fetch_online_prices(
     if payload.get("status") == "error" or "code" in payload:
         message = payload.get("message", "price source rejected the request")
         raise PipelineError(f"Twelve Data error: {message}")
-    return _normalize_price_rows(payload, "Twelve Data"), _redact_url(url), cache_status
+    return _normalize_price_rows(payload, "Twelve Data", market, currency), _redact_url(url), cache_status
 
 
 def fetch_online_news(
@@ -609,6 +1350,8 @@ def fetch_online_news(
     timeout: int,
     cache_dir: Path,
     refresh_cache: bool,
+    market: str = "us",
+    currency: str = "USD",
 ) -> tuple[list[dict[str, Any]], str, str]:
     params = {"s": symbol, "region": "US", "lang": "en-US"}
     url = f"{YAHOO_NEWS_URL}?{urllib.parse.urlencode(params)}"
@@ -617,7 +1360,11 @@ def fetch_online_news(
         root = ET.fromstring(content)
     except ET.ParseError as exc:
         raise PipelineError("Yahoo Finance returned invalid RSS/XML") from exc
-    return _normalize_news_rows(root, "Yahoo Finance RSS"), url, cache_status
+    rows = _normalize_news_rows(root, "Yahoo Finance RSS")
+    for row in rows:
+        row["market"] = market
+        row["currency"] = currency
+    return rows, url, cache_status
 
 
 def _ticker_records(payload: dict[str, Any]) -> list[dict[str, Any]]:
@@ -631,7 +1378,9 @@ def resolve_entity(
     ticker_payload: dict[str, Any],
     submissions_payload: dict[str, Any],
     source: str,
+    instrument: dict[str, str] | None = None,
 ) -> dict[str, Any]:
+    instrument = instrument or parse_symbol(symbol, "us")
     match = next(
         (
             record
@@ -649,17 +1398,26 @@ def resolve_entity(
     if not isinstance(exchanges, list):
         exchanges = []
     return {
-        "symbol": symbol.upper(),
+        "symbol": instrument["symbol"],
+        "provider_symbol": instrument["provider_symbol"],
+        "market": instrument["market"],
+        "market_name": instrument["market_name"],
         "company_name": str(submissions_payload.get("name") or match.get("title") or "unknown"),
         "cik": cik,
-        "exchange": ", ".join(str(item) for item in exchanges if item) or "not reported",
+        "exchange": ", ".join(str(item) for item in exchanges if item) or instrument["exchange"],
         "sic": str(submissions_payload.get("sic", "")),
         "sic_description": str(submissions_payload.get("sicDescription", "")),
+        "currency": instrument["currency"],
         "source": source,
     }
 
 
-def extract_financial_rows(payload: dict[str, Any], source: str, per_metric_limit: int = 20) -> list[dict[str, Any]]:
+def extract_financial_rows(
+    payload: dict[str, Any],
+    source: str,
+    per_metric_limit: int = 20,
+    instrument: dict[str, str] | None = None,
+) -> list[dict[str, Any]]:
     facts = payload.get("facts", {})
     us_gaap = facts.get("us-gaap", {}) if isinstance(facts, dict) else {}
     if not isinstance(us_gaap, dict):
@@ -698,6 +1456,8 @@ def extract_financial_rows(payload: dict[str, Any], source: str, per_metric_limi
                     "unit": preferred_unit,
                     "accession_number": record.get("accn", ""),
                     "source": source,
+                    "market": instrument["market"] if instrument else "us",
+                    "currency": preferred_unit if instrument is None else instrument["currency"],
                 }
             )
     return rows
@@ -708,6 +1468,7 @@ def extract_announcement_rows(
     cik: str,
     source: str,
     limit: int,
+    instrument: dict[str, str] | None = None,
 ) -> list[dict[str, Any]]:
     recent = submissions_payload.get("filings", {}).get("recent", {})
     if not isinstance(recent, dict):
@@ -745,6 +1506,8 @@ def extract_announcement_rows(
                 "accession_number": accession,
                 "url": document_url,
                 "source": source,
+                "market": instrument["market"] if instrument else "us",
+                "currency": instrument["currency"] if instrument else "USD",
             }
         )
     return rows[:limit]
@@ -758,6 +1521,8 @@ def _source_record(
     cache_status: str,
     quality: dict[str, int] | None,
     notes: str,
+    market: str = "us",
+    currency: str = "USD",
 ) -> dict[str, Any]:
     return {
         "dataset": dataset,
@@ -770,6 +1535,8 @@ def _source_record(
         "clean_rows": quality.get("clean_rows", 1) if quality else 1,
         "output_rows": quality.get("output_rows", 1) if quality else 1,
         "notes": notes,
+        "market": market,
+        "currency": currency,
     }
 
 
@@ -820,7 +1587,7 @@ def build_indicators(
     for sentiment in ("positive", "negative", "neutral"):
         add("news", f"{sentiment}_news_count", sentiment_counts.get(sentiment, 0), "articles", "rule-based keyword classification", "title and summary retained in 新闻舆情")
     add("news", "news_tone_balance", sentiment_counts.get("positive", 0) - sentiment_counts.get("negative", 0), "articles", "positive count minus negative count", "rule-based keyword classification")
-    add("announcements", "filing_count", len(announcements), "filings", "count of clean SEC filings", "10-K, 10-Q, and 8-K only")
+    add("announcements", "filing_count", len(announcements), "filings", "count of clean market notices and filings", "clean announcement and filing rows")
 
     latest_by_metric: dict[str, dict[str, Any]] = {}
     ordered_financials = sorted(
@@ -973,10 +1740,13 @@ def build_workbook(
     workbook.properties.title = "MarketSignal Intelligence market research report"
 
     readme_rows = [
-        ["symbol", symbol, "Single-stock stage-two run"],
-        ["company_name", entity["company_name"], "Resolved from SEC entity data"],
-        ["cik", entity["cik"], "SEC central index key"],
-        ["exchange", entity["exchange"], "Resolved from SEC entity data"],
+        ["symbol", symbol, "Single-stock multi-market run"],
+        ["company_name", entity["company_name"], "Resolved from the selected market data source"],
+        ["provider_symbol", entity["provider_symbol"], "Symbol passed to the selected data source"],
+        ["market", entity["market"], entity["market_name"]],
+        ["cik", entity["cik"], "SEC central index key when available"],
+        ["exchange", entity["exchange"], "Resolved from the selected market data source"],
+        ["currency", entity["currency"], "Reporting currency from market or source"],
         ["start_date", start_date or "not specified", "Inclusive market/news/filing boundary"],
         ["end_date", end_date or "not specified", "Inclusive market/news/filing boundary"],
         ["mode", mode, "fixture is deterministic; online uses source adapters"],
@@ -987,7 +1757,7 @@ def build_workbook(
         ["announcement_rows", len(announcements), "Rows after cleaning and range filtering"],
         ["indicator_rows", len(indicators), "Derived market, financial, news, and filing indicators"],
         ["forecast_status", "not implemented in stage two", "Forecasting is planned for a later stage"],
-        ["limitations", "Rule-based news tone is not investment advice", "Financial data is limited to configured SEC concepts"],
+        ["limitations", "Rule-based news tone is not investment advice", "Financial coverage varies by market adapter"],
     ]
     readme = workbook.create_sheet("README")
     _write_table(readme, ["field", "value", "notes"], readme_rows)
@@ -995,15 +1765,15 @@ def build_workbook(
     entity_sheet = workbook.create_sheet("主体信息")
     _write_table(
         entity_sheet,
-        ["symbol", "company_name", "cik", "exchange", "sic", "sic_description", "source"],
-        [[entity[key] for key in ["symbol", "company_name", "cik", "exchange", "sic", "sic_description", "source"]]],
+        ["symbol", "company_name", "provider_symbol", "market", "market_name", "cik", "exchange", "sic", "sic_description", "currency", "source"],
+        [[entity[key] for key in ["symbol", "company_name", "provider_symbol", "market", "market_name", "cik", "exchange", "sic", "sic_description", "currency", "source"]]],
     )
 
     price_sheet = workbook.create_sheet("行情数据")
     _write_table(
         price_sheet,
-        ["date", "open", "high", "low", "close", "volume", "source"],
-        [[row[key] for key in ["date", "open", "high", "low", "close", "volume", "source"]] for row in prices],
+        ["date", "open", "high", "low", "close", "volume", "source", "market", "currency"],
+        [[row[key] for key in ["date", "open", "high", "low", "close", "volume", "source", "market", "currency"]] for row in prices],
     )
     _set_number_format(price_sheet, {"open", "high", "low", "close"}, "0.0000")
     _set_number_format(price_sheet, {"volume"}, "#,##0")
@@ -1011,24 +1781,24 @@ def build_workbook(
     financial_sheet = workbook.create_sheet("财务数据")
     _write_table(
         financial_sheet,
-        ["period_start", "period_end", "filed_date", "fiscal_year", "fiscal_period", "form", "metric", "metric_label", "value", "unit", "accession_number", "source"],
-        [[row[key] for key in ["period_start", "period_end", "filed_date", "fiscal_year", "fiscal_period", "form", "metric", "metric_label", "value", "unit", "accession_number", "source"]] for row in financials],
+        ["period_start", "period_end", "filed_date", "fiscal_year", "fiscal_period", "form", "metric", "metric_label", "value", "unit", "accession_number", "source", "market", "currency"],
+        [[row[key] for key in ["period_start", "period_end", "filed_date", "fiscal_year", "fiscal_period", "form", "metric", "metric_label", "value", "unit", "accession_number", "source", "market", "currency"]] for row in financials],
     )
     _set_number_format(financial_sheet, {"value"}, "#,##0.00")
 
     news_sheet = workbook.create_sheet("新闻舆情")
     _write_table(
         news_sheet,
-        ["published_at", "title", "source", "url", "summary", "sentiment", "sentiment_basis"],
-        [[row[key] for key in ["published_at", "title", "source", "url", "summary", "sentiment", "sentiment_basis"]] for row in news],
+        ["published_at", "title", "source", "url", "summary", "sentiment", "sentiment_basis", "market", "currency"],
+        [[row[key] for key in ["published_at", "title", "source", "url", "summary", "sentiment", "sentiment_basis", "market", "currency"]] for row in news],
     )
     _add_hyperlinks(news_sheet, "url")
 
     announcement_sheet = workbook.create_sheet("公告数据")
     _write_table(
         announcement_sheet,
-        ["filed_date", "report_date", "form", "title", "accession_number", "url", "source"],
-        [[row[key] for key in ["filed_date", "report_date", "form", "title", "accession_number", "url", "source"]] for row in announcements],
+        ["filed_date", "report_date", "form", "title", "accession_number", "url", "source", "market", "currency"],
+        [[row[key] for key in ["filed_date", "report_date", "form", "title", "accession_number", "url", "source", "market", "currency"]] for row in announcements],
     )
     _add_hyperlinks(announcement_sheet, "url")
 
@@ -1043,8 +1813,8 @@ def build_workbook(
     source_sheet = workbook.create_sheet("数据来源")
     _write_table(
         source_sheet,
-        ["dataset", "provider", "mode", "status", "cache_status", "source_location", "raw_rows", "clean_rows", "output_rows", "notes"],
-        [[record[key] for key in ["dataset", "provider", "mode", "status", "cache_status", "source_location", "raw_rows", "clean_rows", "output_rows", "notes"]] for record in source_records],
+        ["dataset", "provider", "mode", "status", "cache_status", "source_location", "raw_rows", "clean_rows", "output_rows", "notes", "market", "currency"],
+        [[record[key] for key in ["dataset", "provider", "mode", "status", "cache_status", "source_location", "raw_rows", "clean_rows", "output_rows", "notes", "market", "currency"]] for record in source_records],
     )
     _add_hyperlinks(source_sheet, "source_location")
 
@@ -1069,6 +1839,7 @@ def run_pipeline(
     end_date: str | None,
     mode: str,
     output: Path,
+    market: str | None = None,
     prices_fixture: Path = DEFAULT_PRICES_FIXTURE,
     news_fixture: Path = DEFAULT_NEWS_FIXTURE,
     entity_fixture: Path = DEFAULT_ENTITY_FIXTURE,
@@ -1082,10 +1853,13 @@ def run_pipeline(
     timeout: int = 20,
 ) -> dict[str, Any]:
     _validate_request(symbol, start_date, end_date, mode, output, announcement_limit)
-    normalized_symbol = symbol.upper()
+    instrument = parse_symbol(symbol, market)
+    normalized_symbol = instrument["symbol"]
     source_records: list[dict[str, Any]] = []
 
     if mode == "fixture":
+        if instrument["market"] != "us":
+            raise PipelineError("fixture mode currently contains the US AAPL sample; use online mode for Chinese markets")
         price_payload = _load_json(prices_fixture)
         news_root = _load_xml(news_fixture)
         ticker_payload = _load_json(entity_fixture)
@@ -1098,60 +1872,132 @@ def run_pipeline(
         announcement_location = _fixture_location(submissions_fixture)
         cache_status = "not_applicable"
         price_cache = news_cache = entity_cache = financial_cache = announcement_cache = cache_status
-        raw_prices = _normalize_price_rows(price_payload, "fixture:prices")
+        raw_prices = _normalize_price_rows(price_payload, "fixture:prices", instrument["market"], instrument["currency"])
         raw_news = _normalize_news_rows(news_root, "fixture:news")
-        entity = resolve_entity(normalized_symbol, ticker_payload, submissions_payload, "fixture:SEC entity data")
-        raw_financials = extract_financial_rows(financials_payload, "fixture:SEC companyfacts")
-        raw_announcements = extract_announcement_rows(submissions_payload, entity["cik"], "fixture:SEC submissions", announcement_limit)
+        for row in raw_news:
+            row["market"] = instrument["market"]
+            row["currency"] = instrument["currency"]
+        entity = resolve_entity(
+            instrument["provider_symbol"], ticker_payload, submissions_payload, "fixture:SEC entity data", instrument
+        )
+        raw_financials = extract_financial_rows(
+            financials_payload, "fixture:SEC companyfacts", instrument=instrument
+        )
+        raw_announcements = extract_announcement_rows(
+            submissions_payload,
+            entity["cik"],
+            "fixture:SEC submissions",
+            announcement_limit,
+            instrument,
+        )
+        price_provider = news_provider = entity_provider = financial_provider = announcement_provider = "fixture"
+        financial_notes = "configured fixture financial concepts"
     else:
-        key = api_key or os.environ.get("MARKETSIGNAL_TWELVE_DATA_API_KEY")
-        if not key:
-            raise PipelineError("online mode requires --twelve-data-api-key or MARKETSIGNAL_TWELVE_DATA_API_KEY")
-        sec_identity = sec_user_agent or os.environ.get("MARKETSIGNAL_SEC_USER_AGENT")
-        sec_headers = _sec_headers(sec_identity or "")
-        raw_prices, price_location, price_cache = fetch_online_prices(
-            normalized_symbol, start_date, end_date, key, timeout, cache_dir, refresh_cache
-        )
-        raw_news, news_location, news_cache = fetch_online_news(normalized_symbol, timeout, cache_dir, refresh_cache)
-        ticker_payload, entity_cache = _fetch_json(
-            SEC_TICKERS_URL,
-            timeout,
-            headers=sec_headers,
-            cache_dir=cache_dir,
-            refresh_cache=refresh_cache,
-            is_sec_request=True,
-        )
-        match = next(
-            (record for record in _ticker_records(ticker_payload) if str(record.get("ticker", "")).upper() == normalized_symbol),
-            None,
-        )
-        if not match:
-            raise PipelineError(f"SEC ticker mapping did not find symbol: {normalized_symbol}")
-        cik = str(match.get("cik_str", match.get("cik", ""))).zfill(10)
-        submissions_url = f"{SEC_SUBMISSIONS_URL}/CIK{cik}.json"
-        submissions_payload, announcement_cache = _fetch_json(
-            submissions_url,
-            timeout,
-            headers=sec_headers,
-            cache_dir=cache_dir,
-            refresh_cache=refresh_cache,
-            is_sec_request=True,
-        )
-        entity = resolve_entity(normalized_symbol, ticker_payload, submissions_payload, "SEC EDGAR")
-        facts_url = f"{SEC_COMPANYFACTS_URL}/CIK{entity['cik']}.json"
-        financials_payload, financial_cache = _fetch_json(
-            facts_url,
-            timeout,
-            headers=sec_headers,
-            cache_dir=cache_dir,
-            refresh_cache=refresh_cache,
-            is_sec_request=True,
-        )
-        raw_financials = extract_financial_rows(financials_payload, "SEC companyfacts")
-        raw_announcements = extract_announcement_rows(submissions_payload, entity["cik"], "SEC submissions", announcement_limit)
-        entity_location = SEC_TICKERS_URL
-        financial_location = facts_url
-        announcement_location = submissions_url
+        if instrument["market"] in CHINA_MARKETS:
+            raw_prices, price_location, price_cache, price_provider = fetch_online_china_prices(
+                instrument, start_date, end_date, cache_dir, refresh_cache
+            )
+            raw_news, news_location, news_cache, news_provider = fetch_online_china_news(
+                instrument, cache_dir, refresh_cache
+            )
+            (
+                raw_financials,
+                entity,
+                financial_location,
+                financial_cache,
+                financial_provider,
+                financial_notes,
+            ) = fetch_online_china_financials(instrument, cache_dir, refresh_cache)
+            raw_announcements, announcement_location, announcement_cache, announcement_provider = fetch_online_china_announcements(
+                instrument, start_date, end_date, cache_dir, refresh_cache
+            )
+            entity_location = financial_location
+            entity_cache = "derived"
+            entity_provider = "AKShare"
+        else:
+            key = api_key or os.environ.get("MARKETSIGNAL_TWELVE_DATA_API_KEY")
+            if not key:
+                raise PipelineError("online mode requires --twelve-data-api-key or MARKETSIGNAL_TWELVE_DATA_API_KEY")
+            sec_identity = sec_user_agent or os.environ.get("MARKETSIGNAL_SEC_USER_AGENT")
+            sec_headers = _sec_headers(sec_identity or "")
+            raw_prices, price_location, price_cache = fetch_online_prices(
+                instrument["provider_symbol"],
+                start_date,
+                end_date,
+                key,
+                timeout,
+                cache_dir,
+                refresh_cache,
+                instrument["market"],
+                instrument["currency"],
+            )
+            raw_news, news_location, news_cache = fetch_online_news(
+                instrument["provider_symbol"],
+                timeout,
+                cache_dir,
+                refresh_cache,
+                instrument["market"],
+                instrument["currency"],
+            )
+            ticker_payload, entity_cache = _fetch_json(
+                SEC_TICKERS_URL,
+                timeout,
+                headers=sec_headers,
+                cache_dir=cache_dir,
+                refresh_cache=refresh_cache,
+                is_sec_request=True,
+            )
+            match = next(
+                (
+                    record
+                    for record in _ticker_records(ticker_payload)
+                    if str(record.get("ticker", "")).upper() == instrument["provider_symbol"]
+                ),
+                None,
+            )
+            if not match:
+                raise PipelineError(f"SEC ticker mapping did not find symbol: {instrument['provider_symbol']}")
+            cik = str(match.get("cik_str", match.get("cik", ""))).zfill(10)
+            submissions_url = f"{SEC_SUBMISSIONS_URL}/CIK{cik}.json"
+            submissions_payload, announcement_cache = _fetch_json(
+                submissions_url,
+                timeout,
+                headers=sec_headers,
+                cache_dir=cache_dir,
+                refresh_cache=refresh_cache,
+                is_sec_request=True,
+            )
+            entity = resolve_entity(
+                instrument["provider_symbol"], ticker_payload, submissions_payload, "SEC EDGAR", instrument
+            )
+            facts_url = f"{SEC_COMPANYFACTS_URL}/CIK{entity['cik']}.json"
+            financials_payload, financial_cache = _fetch_json(
+                facts_url,
+                timeout,
+                headers=sec_headers,
+                cache_dir=cache_dir,
+                refresh_cache=refresh_cache,
+                is_sec_request=True,
+            )
+            raw_financials = extract_financial_rows(
+                financials_payload, "SEC companyfacts", instrument=instrument
+            )
+            raw_announcements = extract_announcement_rows(
+                submissions_payload,
+                entity["cik"],
+                "SEC submissions",
+                announcement_limit,
+                instrument,
+            )
+            entity_location = SEC_TICKERS_URL
+            financial_location = facts_url
+            announcement_location = submissions_url
+            price_provider = "Twelve Data"
+            news_provider = "Yahoo Finance RSS"
+            entity_provider = "SEC EDGAR"
+            financial_provider = "SEC companyfacts"
+            announcement_provider = "SEC submissions"
+            financial_notes = "configured US-GAAP concepts from 10-K and 10-Q filings"
 
     prices, price_quality = clean_prices(raw_prices)
     financials, financial_quality = clean_financials(raw_financials)
@@ -1168,11 +2014,11 @@ def run_pipeline(
 
     source_records.extend(
         [
-            _source_record("prices", "Twelve Data" if mode == "online" else "fixture", mode, price_location, price_cache, price_quality, "daily OHLCV data"),
-            _source_record("news", "Yahoo Finance RSS" if mode == "online" else "fixture", mode, news_location, news_cache, news_quality, "news headlines and source text"),
-            _source_record("entity", "SEC EDGAR" if mode == "online" else "fixture", mode, entity_location, entity_cache, None, "symbol-to-CIK mapping and entity attributes"),
-            _source_record("financials", "SEC companyfacts" if mode == "online" else "fixture", mode, financial_location, financial_cache, financial_quality, "configured US-GAAP concepts from 10-K and 10-Q filings"),
-            _source_record("announcements", "SEC submissions" if mode == "online" else "fixture", mode, announcement_location, announcement_cache, announcement_quality, "10-K, 10-Q, and 8-K filing history"),
+            _source_record("prices", price_provider, mode, price_location, price_cache, price_quality, "daily OHLCV data", instrument["market"], instrument["currency"]),
+            _source_record("news", news_provider, mode, news_location, news_cache, news_quality, "news headlines and source text", instrument["market"], instrument["currency"]),
+            _source_record("entity", entity_provider, mode, entity_location, entity_cache, None, "symbol-to-entity mapping and entity attributes", instrument["market"], instrument["currency"]),
+            _source_record("financials", financial_provider, mode, financial_location, financial_cache, financial_quality, financial_notes, instrument["market"], instrument["currency"]),
+            _source_record("announcements", announcement_provider, mode, announcement_location, announcement_cache, announcement_quality, "market filing and notice history", instrument["market"], instrument["currency"]),
         ]
     )
 
@@ -1204,6 +2050,9 @@ def run_pipeline(
     return {
         "symbol": normalized_symbol,
         "company_name": entity["company_name"],
+        "market": entity["market"],
+        "market_name": entity["market_name"],
+        "currency": entity["currency"],
         "mode": mode,
         "output": str(output),
         "price_rows": len(prices),
@@ -1220,8 +2069,9 @@ def run_pipeline(
 
 
 def _build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Collect market, financial, news, and filing data into a traceable Excel workbook")
-    parser.add_argument("--symbol", required=True, help="single stock symbol")
+    parser = argparse.ArgumentParser(description="Collect multi-market prices, financials, news, and notices into a traceable Excel workbook")
+    parser.add_argument("--symbol", required=True, help="single stock symbol, such as 600519, 00700.HK, or AAPL")
+    parser.add_argument("--market", choices=["cn_a", "cn_b", "hk", "us"], help="optional market override")
     parser.add_argument("--start-date", help="inclusive YYYY-MM-DD date")
     parser.add_argument("--end-date", help="inclusive YYYY-MM-DD date")
     parser.add_argument("--mode", choices=["fixture", "online"], default="fixture")
@@ -1250,6 +2100,7 @@ def main(argv: list[str] | None = None) -> int:
             end_date=args.end_date,
             mode=args.mode,
             output=args.output,
+            market=args.market,
             prices_fixture=args.prices_fixture,
             news_fixture=args.news_fixture,
             entity_fixture=args.entity_fixture,

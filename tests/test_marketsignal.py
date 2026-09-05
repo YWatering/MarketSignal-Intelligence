@@ -20,11 +20,15 @@ from marketsignal import (
     _redact_url,
     _cache_path,
     _fetch_text,
+    _normalize_dataframe_news_rows,
+    _normalize_dataframe_price_rows,
     _sec_headers,
     clean_financials,
     clean_news,
     clean_prices,
+    extract_china_financial_rows,
     extract_financial_rows,
+    parse_symbol,
     run_pipeline,
 )
 
@@ -154,6 +158,132 @@ class MarketSignalTests(unittest.TestCase):
         self.assertEqual(2, len(cleaned))
         self.assertEqual(0, quality["duplicates_removed"])
         self.assertEqual({"2026-04-01", "2026-01-01"}, {row["period_start"] for row in cleaned})
+
+    def test_market_symbol_parsing_covers_china_and_us_markets(self) -> None:
+        self.assertEqual(
+            {"symbol": "600519.SH", "market": "cn_a", "currency": "CNY", "exchange": "SSE"},
+            {key: parse_symbol("600519")[key] for key in ("symbol", "market", "currency", "exchange")},
+        )
+        self.assertEqual(
+            {"symbol": "900901.SH", "market": "cn_b", "currency": "USD", "exchange": "SSE"},
+            {key: parse_symbol("900901")[key] for key in ("symbol", "market", "currency", "exchange")},
+        )
+        self.assertEqual(
+            {"symbol": "200002.SZ", "market": "cn_b", "currency": "HKD", "exchange": "SZSE"},
+            {key: parse_symbol("200002")[key] for key in ("symbol", "market", "currency", "exchange")},
+        )
+        self.assertEqual(
+            {"symbol": "00700.HK", "market": "hk", "currency": "HKD", "exchange": "HKEX"},
+            {key: parse_symbol("HK00700")[key] for key in ("symbol", "market", "currency", "exchange")},
+        )
+        self.assertEqual("us", parse_symbol("NASDAQ:AAPL")["market"])
+
+    def test_market_symbol_parsing_rejects_conflicting_exchange(self) -> None:
+        with self.assertRaises(PipelineError):
+            parse_symbol("600519.HK")
+        with self.assertRaises(PipelineError):
+            parse_symbol("200002.SH")
+        with self.assertRaises(PipelineError):
+            parse_symbol("600519", market="cn_b")
+
+    def test_china_price_and_news_rows_are_normalized(self) -> None:
+        prices = _normalize_dataframe_price_rows(
+            [
+                {"日期": "2026-08-12", "开盘": "1,000", "最高": 1010, "最低": 990, "收盘": "1005", "成交量": 1234},
+            ],
+            "AKShare stock_zh_a_hist_tx",
+            "cn_a",
+            "CNY",
+        )
+        self.assertEqual("2026-08-12", prices[0]["date"])
+        self.assertEqual(1000.0, prices[0]["open"])
+        self.assertEqual("CNY", prices[0]["currency"])
+        news = _normalize_dataframe_news_rows(
+            [
+                {
+                    "新闻标题": "贵州茅台营收增长，市场看好",
+                    "新闻内容": "公司盈利改善并创纪录",
+                    "发布时间": "2026-08-12 09:30:00",
+                    "文章来源": "测试来源",
+                    "新闻链接": "https://example.test/maotai",
+                }
+            ],
+            "AKShare stock_news_em",
+            "cn_a",
+            "CNY",
+        )
+        cleaned, quality = clean_news(news)
+        self.assertEqual(1, len(cleaned))
+        self.assertEqual("positive", cleaned[0]["sentiment"])
+        self.assertIn("增长", cleaned[0]["sentiment_basis"])
+        self.assertEqual(0, quality["invalid_rows"])
+
+    def test_china_financial_tables_map_to_common_metrics(self) -> None:
+        instrument = parse_symbol("600519")
+        tables = {
+            "profit": [
+                {
+                    "REPORT_DATE": "2026-06-30",
+                    "NOTICE_DATE": "2026-08-29",
+                    "REPORT_TYPE": "中报",
+                    "TOTAL_OPERATE_INCOME": "90,000,000,000",
+                    "PARENT_NETPROFIT": 45_000_000_000,
+                    "CURRENCY": "CNY",
+                }
+            ],
+            "balance": [
+                {
+                    "REPORT_DATE": "2026-06-30",
+                    "NOTICE_DATE": "2026-08-29",
+                    "REPORT_TYPE": "中报",
+                    "TOTAL_ASSETS": 300_000_000_000,
+                    "TOTAL_LIABILITIES": 100_000_000_000,
+                    "TOTAL_CURRENT_ASSETS": 150_000_000_000,
+                    "TOTAL_CURRENT_LIAB": 80_000_000_000,
+                    "MONETARYFUNDS": 50_000_000_000,
+                    "CURRENCY": "CNY",
+                }
+            ],
+            "cash": [
+                {
+                    "REPORT_DATE": "2026-06-30",
+                    "NOTICE_DATE": "2026-08-29",
+                    "REPORT_TYPE": "中报",
+                    "NETCASH_OPERATE": 40_000_000_000,
+                    "CURRENCY": "CNY",
+                }
+            ],
+        }
+        rows = extract_china_financial_rows(tables, instrument)
+        cleaned, quality = clean_financials(rows)
+        self.assertEqual(8, len(cleaned))
+        self.assertEqual(0, quality["invalid_rows"])
+        self.assertEqual(
+            {"revenue", "net_income", "assets", "liabilities", "current_assets", "current_liabilities", "cash_and_equivalents", "operating_cash_flow"},
+            {row["metric"] for row in cleaned},
+        )
+        self.assertTrue(all(row["market"] == "cn_a" and row["currency"] == "CNY" for row in cleaned))
+
+    def test_hong_kong_annual_report_code_is_normalized(self) -> None:
+        instrument = parse_symbol("00700.HK")
+        rows = extract_china_financial_rows(
+            {
+                "profit": [
+                    {
+                        "REPORT_DATE": "2025-12-31 00:00:00",
+                        "DATE_TYPE_CODE": "001",
+                        "START_DATE": "2025-01-01 00:00:00",
+                        "STD_ITEM_NAME": "营业额",
+                        "AMOUNT": 100,
+                    }
+                ]
+            },
+            instrument,
+        )
+        cleaned, quality = clean_financials(rows)
+        self.assertEqual(1, len(cleaned))
+        self.assertEqual("年度", cleaned[0]["form"])
+        self.assertEqual(0, quality["invalid_rows"])
 
     def test_sec_user_agent_and_url_redaction(self) -> None:
         self.assertEqual(
