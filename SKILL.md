@@ -11,7 +11,7 @@ Use this skill for repeatable market-research workflows involving one or more ex
 
 ## Current Stage
 
-Stage four provides all earlier collection, governance, and forecasting capabilities plus:
+Stage five provides all earlier collection, governance, and forecasting capabilities plus:
 
 - A structured input contract for one stock, one market, and an optional date range.
 - Symbol parsing for China A shares (`cn_a`), China B shares (`cn_b`), Hong Kong stocks (`hk`), and US stocks (`us`).
@@ -22,16 +22,17 @@ Stage four provides all earlier collection, governance, and forecasting capabili
 - Basic cleaning, deduplication, range filtering, source tracking, local response caching, and traceable Excel export.
 - Rule-based Chinese and English news tone classification with matched-keyword evidence.
 - Market, financial, news, and notice indicators with calculation methods.
-- A last-close persistence baseline and an explainable multi-signal ridge regression model.
+- Last-close, moving-average, historical-mean, exponential-smoothing, and explainable multi-signal ridge candidate models.
 - Features derived from cleaned online prices, financial filings, news tone, and notices produced by the same stage-two run.
-- Expanding-window one-step-ahead walk-forward validation with MAE, RMSE, MAPE, return MAE, and direction accuracy.
-- Model selection by validation RMSE, future point forecasts, empirical prediction intervals, actual-versus-predicted backtest rows, and standardized feature coefficients.
+- Expanding-window one-step-ahead walk-forward validation with price, return, direction, bias, and empirical interval metrics.
+- Balanced price-and-direction model selection with fixed improvement gates, multiple robustness windows, volatility slices, explicit selection reasons, and cost sensitivity analysis.
+- Future point forecasts, empirical prediction intervals, actual-versus-predicted backtest rows, and standardized feature coefficients for all candidates.
 - Versioned manifests for multi-stock portfolios and user-defined industry or theme baskets.
 - Per-item retries, failure isolation, structured JSONL logs, and interval-based repeatable execution state.
 - Optional primary-versus-secondary price validation for China A shares and Hong Kong stocks.
 - Central versions for the Skill, contracts, source adapters, forecast engine, models, and Excel templates.
 
-Stage four does not automatically discover industry or theme constituents, run an always-on scheduler, provide causal claims, guarantee returns, implement advanced sentiment models, or apply exchange-holiday calendars. Do not present a forecast as investment advice or certainty.
+Stage five does not automatically discover industry or theme constituents, run an always-on scheduler, provide causal claims, guarantee returns, implement advanced sentiment models, or apply exchange-holiday calendars. Do not present a forecast as investment advice or certainty.
 
 ## Workflow
 
@@ -41,7 +42,7 @@ Stage four does not automatically discover industry or theme constituents, run a
 4. Use online mode for current Chinese-market research when AKShare and network access are available. Use online US mode only when the Twelve Data key, SEC User-Agent, and required network access are available.
 5. Run `scripts/marketsignal.py` for one stock or `scripts/market_batch.py` for a manifest. Add forecasting only in online mode and use enough history.
 6. For Chinese markets, inspect source and cache status. Request price cross-validation when the user needs source consistency evidence; unsupported markets must be reported explicitly.
-7. For forecasting, use only records returned and cleaned by the current single-stock run. Reject fixture rows, enforce point-in-time availability, and keep future external features fixed at the last real data cutoff.
+7. For forecasting, use only records returned and cleaned by the current single-stock run. Reject fixture rows, enforce point-in-time availability, keep future external features fixed at the last real data cutoff, and inspect `模型评估`, `模型稳健性`, and `成本敏感性` before interpreting the selected model.
 8. Treat missing, invalid, duplicated, out-of-range, unsupported, source-failed, mismatched, or insufficient-history records as quality signals. Keep completed batch items when another item fails.
 9. Deliver all workbook paths and summarize per-item status, attempts, source validation, market, currency, data cutoff, row counts, selected model, validation metrics, forecast interval, limitations, and quality warnings.
 
@@ -105,7 +106,7 @@ Run the validation suite:
 - Keep raw and cleaned records logically separate in the processing flow.
 - Include source, market, currency, data range, row counts, limitations, and quality checks in the workbook.
 - Include entity mapping, financial-reporting period, filing or notice date, accession number when available, calculation method, and source location where applicable.
-- For forecasts, include data cutoff, training and validation ranges, baseline comparison, model version, validation method, error metrics, interval method, backtest details, and feature coefficients.
+- For forecasts, include data cutoff, training and validation ranges, all candidate models, baseline comparison, model version, validation method, error metrics, selection thresholds and reasons, robustness windows, cost assumptions, interval method, backtest details, and feature coefficients.
 - For multi-stock tasks, require an explicit versioned manifest and retain every normalized constituent, attempt count, output path, and isolated failure.
 - When cross-validation is requested, compare aligned closes without replacing the primary series; report unsupported adapters or mismatches.
 - Include the central component versions in every workbook and keep output schemas compatible with the declared contract version.

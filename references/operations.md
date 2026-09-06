@@ -1,4 +1,4 @@
-# Stage-Four Operations and Versioning
+# Stage-Five Operations and Versioning
 
 Read this reference when diagnosing source consistency, retries, logs, scheduled execution, or component compatibility.
 
@@ -46,7 +46,7 @@ File order and `sequence` define event order. Durations use seconds. Errors inhe
 - Source adapter version.
 - Forecast engine version.
 - Workbook template version.
-- Baseline and ridge model versions.
+- All candidate baseline model versions and the ridge model version.
 
 Every single-stock and batch workbook contains a `版本信息` sheet. Change a version when its external behavior, schema, model implementation, or output contract changes. Documentation and tests must be updated in the same change.
 

@@ -1,4 +1,4 @@
-# Stage-Three Forecasting Rules
+# Stage-Five Forecasting Rules
 
 Read this reference when a user requests price prediction, model evaluation, backtesting, or forecast interpretation.
 
@@ -31,7 +31,7 @@ Each supervised sample uses features available at the current trading observatio
 Technical features:
 
 - One-day and five-day close return.
-- Close deviation from five-day and twenty-day moving averages.
+- Close deviation from five-day and twenty-day moving averages and the ten-day exponential average.
 - Twenty-day close-return volatility.
 - Current volume relative to twenty-day average volume.
 
@@ -51,11 +51,23 @@ Fundamental features:
 
 Financial features use only rows whose `filed_date` is on or before the feature date. Missing ratios are set to zero and accompanied by `fundamental_coverage`, allowing the model to distinguish no coverage from a complete set of ratios.
 
-## Models
+## Candidate Models
 
 ### Last-Close Baseline
 
 `last_close_baseline` predicts zero return, so the predicted next close equals the current close. It is required as a realistic hurdle for the more complex model.
+
+### Moving-Average Baseline
+
+`moving_average_baseline` predicts a return that moves the next close toward the trailing five-day moving average. It is a transparent mean-reversion hurdle, not a guarantee that prices revert.
+
+### Historical-Mean Baseline
+
+`historical_mean_baseline` predicts the mean next-period return observed in the earlier training samples.
+
+### Exponential-Smoothing Baseline
+
+`exponential_smoothing_baseline` predicts a return that moves the next close toward a ten-day exponential moving average.
 
 ### Multi-Signal Ridge
 
@@ -63,14 +75,14 @@ Financial features use only rows whose `filed_date` is on or before the feature 
 
 Predicted returns are bounded using the historical target-return distribution, with a lower absolute cap of 2% and an upper cap of 20%. This is a numerical stability control, not a market price-limit rule.
 
-## Validation
+## Validation And Selection
 
 Use expanding-window one-step-ahead walk-forward validation:
 
 1. Keep samples in chronological order.
 2. Reserve the requested number of final samples for validation, subject to retaining at least 40 earlier training samples.
-3. For each validation target, fit feature scaling and the ridge model only on earlier samples.
-4. Predict the next close for both models.
+3. For each validation target, fit each model only on earlier samples; ridge scaling is also fit only on that training fold.
+4. Predict the next close for every candidate model.
 5. Append the actual and predicted values to `回测明细`.
 
 Report:
@@ -80,8 +92,25 @@ Report:
 - MAPE as a percentage of actual close.
 - Return MAE in percentage points.
 - Three-way direction accuracy for rise, flat, or fall.
+- Macro-averaged three-way direction F1.
+- Mean price and return bias.
+- Empirical interval coverage and width.
 
-Select the lower-RMSE model, using MAE as the tie-breaker. Do not override the result to favor the more complex model.
+The selector combines normalized price performance and direction accuracy. The default weights are 65% price performance and 35% direction performance. Each candidate must first pass robustness and relative-performance checks; the last-close baseline is always eligible as the minimum performance hurdle.
+
+For `multisignal_ridge`, selection also requires either the configured minimum price RMSE improvement or the configured minimum direction improvement against the last-close baseline. The default gates are 2% price improvement or 5 percentage points of direction improvement, while allowing no more than 1% price deterioration or 5 percentage points of direction deterioration. Every row stores an explicit selection reason.
+
+Do not override the result to favor the more complex model.
+
+## Robustness Checks
+
+The default validation windows are 20, 40, and 80 samples, shortened only when the available history cannot support the requested size. Each candidate is evaluated on the complete window and on low- and high-volatility slices based on the validation-window median of `volatility_20`. The `模型稳健性` sheet records metrics and a `robustness_status` for every measured window and regime.
+
+Model parameters, feature definitions, score weights, and improvement gates are fixed before the validation result is inspected. These checks reduce single-window selection bias but do not replace independent live monitoring.
+
+## Transaction-Cost Sensitivity
+
+The backtest converts each predicted direction into a simple research signal in `{-1, 0, 1}`. It reports `no_cost`, `slippage_only`, and `base_cost` scenarios. Each scenario includes cumulative gross and net return, maximum drawdown, active-signal win rate, turnover, trade count, and total modeled cost. This is a sensitivity analysis, not an execution simulator or return guarantee.
 
 ## Prediction Interval
 

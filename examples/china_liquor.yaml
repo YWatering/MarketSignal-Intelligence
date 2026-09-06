@@ -1,4 +1,4 @@
-version: "1.0"
+version: "2.0"
 name: china-liquor-comparison
 task_type: industry
 group: 白酒
@@ -7,6 +7,18 @@ start_date: 2024-01-01
 end_date: latest
 forecast: true
 forecast_horizon: 5
+forecast_minimum_history: 120
+forecast_validation_points: 40
+forecast_ridge_alpha: 1.0
+forecast_robustness_windows: [20, 40, 80]
+forecast_price_weight: 0.65
+forecast_direction_weight: 0.35
+forecast_min_price_improvement_pct: 2.0
+forecast_min_direction_improvement_points: 5.0
+forecast_max_price_deterioration_pct: 1.0
+forecast_max_direction_deterioration_points: 5.0
+forecast_transaction_cost_bps: 10.0
+forecast_slippage_bps: 5.0
 cross_validate_prices: true
 cross_validation_tolerance_pct: 1.0
 output_dir: outputs/china_liquor

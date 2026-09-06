@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run deterministic stage-four end-to-end acceptance checks."""
+"""Run deterministic end-to-end acceptance checks."""
 
 from __future__ import annotations
 
@@ -10,6 +10,7 @@ from pathlib import Path
 from openpyxl import load_workbook
 
 from market_batch import run_batch
+from versioning import BATCH_CONTRACT_VERSION
 
 
 def main() -> int:
@@ -19,7 +20,7 @@ def main() -> int:
         manifest.write_text(
             "\n".join(
                 [
-                    'version: "1.0"',
+                    f'version: "{BATCH_CONTRACT_VERSION}"',
                     "name: fixture-acceptance",
                     "task_type: portfolio",
                     "mode: fixture",

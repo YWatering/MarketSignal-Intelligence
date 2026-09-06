@@ -1,4 +1,4 @@
-# Stage-Four Data Contract
+# Stage-Five Data Contract
 
 ## Request
 
@@ -16,11 +16,20 @@ The command-line interface accepts:
 | `sec_user_agent` | US online | Application name plus contact email, or `MARKETSIGNAL_SEC_USER_AGENT`. |
 | `cache_dir` | no | Local response cache directory. |
 | `refresh_cache` | no | Ignore existing cached responses for this run. |
-| `forecast` | no | Run stage-three forecasting. Requires `mode=online`. |
+| `forecast` | no | Run stage-five forecasting and model selection. Requires `mode=online`. |
 | `forecast_horizon` | forecast | Future trading steps from 1 to 20. Default: 5. |
 | `forecast_minimum_history` | forecast | Minimum clean online price rows. Default: 120; cannot be lower than 80. |
 | `forecast_validation_points` | forecast | Requested walk-forward validation rows. Default: 40; minimum: 10. |
 | `forecast_ridge_alpha` | forecast | Positive ridge regularization strength. Default: 1.0. |
+| `forecast_robustness_windows` | forecast | Validation window sizes for robustness checks. Default: 20, 40, 80; each usable window must be at least 10. |
+| `forecast_price_weight` | forecast | Price-error component weight in balanced selection score. Default: 0.65. |
+| `forecast_direction_weight` | forecast | Direction component weight in balanced selection score. Default: 0.35. |
+| `forecast_min_price_improvement_pct` | forecast | Minimum ridge price RMSE improvement over the last-close baseline. Default: 2.0 percentage points. |
+| `forecast_min_direction_improvement_points` | forecast | Minimum ridge direction improvement over the last-close baseline. Default: 5.0 percentage points. |
+| `forecast_max_price_deterioration_pct` | forecast | Maximum allowed relative price deterioration versus the baseline. Default: 1.0 percentage point. |
+| `forecast_max_direction_deterioration_points` | forecast | Maximum allowed direction deterioration versus the baseline. Default: 5.0 percentage points. |
+| `forecast_transaction_cost_bps` | forecast | Base transaction-cost assumption for sensitivity analysis. Default: 10.0 basis points. |
+| `forecast_slippage_bps` | forecast | Slippage assumption for sensitivity analysis. Default: 5.0 basis points. |
 | `cross_validate_prices` | no | Compare primary close prices with a configured secondary adapter. |
 | `cross_validation_tolerance_pct` | cross-validation | Positive allowed close difference percentage. Default: 1.0. |
 
@@ -140,7 +149,7 @@ Announcement rows include filing or notice date, report date when available, for
 
 ## Forecast Contract
 
-Stage three consumes the cleaned records created by the same stage-two run. It does not read a separate manually prepared prediction dataset.
+Stage five consumes the cleaned records created by the same stage-two run. It does not read a separate manually prepared prediction dataset.
 
 Required prediction inputs:
 
@@ -149,12 +158,15 @@ Required prediction inputs:
 - Any available financial, news, and announcement rows from the same run; fixture rows in any prediction dataset cause failure.
 - A valid market and currency inherited from the normalized instrument.
 
-Two models are always evaluated:
+Five models are always evaluated:
 
 - `last_close_baseline` / `persistence-v1`: predicts the next close as the previous close.
+- `moving_average_baseline` / `moving-average-v1`: mean-reversion baseline toward the trailing five-day average.
+- `historical_mean_baseline` / `historical-mean-v1`: predicts the mean return from earlier training samples.
+- `exponential_smoothing_baseline` / `ewma-v1`: mean-reversion baseline toward the ten-day exponential average.
 - `multisignal_ridge` / `ridge-v1`: predicts the next-period return from standardized technical, financial, news, and announcement features with ridge regularization.
 
-Validation uses expanding-window one-step-ahead walk-forward evaluation. Each validation target is predicted from a model trained only on earlier samples. The selected model is the model with lower validation RMSE, using MAE as a tie-breaker. A simpler baseline may therefore be selected when the more complex model does not improve out-of-sample error.
+Validation uses expanding-window one-step-ahead walk-forward evaluation. Each validation target is predicted from a model trained only on earlier samples. Selection combines price performance and direction accuracy, requires robustness against the last-close baseline, and applies configured improvement and deterioration gates. A simpler baseline may therefore be selected when the richer model does not improve out-of-sample results.
 
 The forecast result record contains:
 
@@ -168,6 +180,7 @@ The forecast result record contains:
   "data_cutoff": "YYYY-MM-DD",
   "previous_close": 0.0,
   "predicted_return": 0.0,
+  "predicted_direction": 0,
   "predicted_close": 0.0,
   "lower_bound": 0.0,
   "upper_bound": 0.0,
@@ -202,9 +215,11 @@ The generated workbook contains these sheets:
 | `新闻舆情` | Cleaned news records, links, Chinese or English rule-based tone, and evidence. |
 | `公告数据` | Cleaned China notices or US SEC filing history. |
 | `指标分析` | Derived market, financial, news, and notice indicators with methods. |
-| `预测结果` | Baseline and ridge future forecasts, selected-model flag, point estimates, uncertainty bounds, data cutoff, and input status. Present only for forecast runs. |
-| `模型评估` | Walk-forward ranges, MAE, RMSE, MAPE, return MAE, direction accuracy, interval error, regularization, and leakage controls. Present only for forecast runs. |
-| `回测明细` | One-step predictions and actual closes for every validation target and both models. Present only for forecast runs. |
+| `预测结果` | All candidate-model forecasts, selected-model flag, direction, point estimates, uncertainty bounds, data cutoff, and input status. Present only for forecast runs. |
+| `模型评估` | Walk-forward metrics, balanced score, improvement gates, robustness status, selection reason, and leakage controls. Present only for forecast runs. |
+| `回测明细` | One-step predictions and actual closes for every validation target and every candidate model. Present only for forecast runs. |
+| `模型稳健性` | Candidate metrics across configured windows and volatility regimes. Present only for forecast runs. |
+| `成本敏感性` | Gross/net research return and turnover sensitivity under configured cost scenarios. Present only for forecast runs. |
 | `特征贡献` | Standardized ridge coefficients, rank, direction, current feature value, and non-causal feature description. Present only for forecast runs. |
 | `交叉校验` | Primary and secondary price providers, overlap, close differences, configured tolerance, and status. Present only when requested. |
 | `数据来源` | Provider, market, currency, mode, cache status, source location, raw, clean, and output row counts, and notes. |

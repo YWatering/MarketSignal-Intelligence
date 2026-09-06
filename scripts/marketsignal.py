@@ -1849,8 +1849,14 @@ def build_workbook(
                 ["forecast_data_cutoff", forecast_result["data_cutoff"], "Last real stage-two trading observation used by the model"],
                 ["forecast_horizon", forecast_result["forecast_horizon"], "Estimated future trading steps"],
                 ["selected_model", forecast_result["selected_model"], forecast_result["selected_model_version"]],
+                ["candidate_models", ", ".join(forecast_result["model_names"]), "All candidates evaluated before selection"],
                 ["training_price_rows", forecast_result["training_price_rows"], "Clean online price rows used for feature construction"],
                 ["validation_samples", forecast_result["validation_samples"], "Expanding-window one-step-ahead validation rows"],
+                ["selection_price_weight", forecast_result["selection_config"]["price_weight"], "Normalized weight for price-error score"],
+                ["selection_direction_weight", forecast_result["selection_config"]["direction_weight"], "Normalized weight for direction score"],
+                ["robustness_windows", ", ".join(str(window) for window in forecast_result["robustness_windows"]), "Validation windows used for robustness checks"],
+                ["forecast_transaction_cost_bps", forecast_result["cost_config"]["transaction_cost_bps"], "Base transaction-cost assumption in basis points"],
+                ["forecast_slippage_bps", forecast_result["cost_config"]["slippage_bps"], "Slippage assumption in basis points"],
                 ["forecast_limitations", forecast_result["limitations"], "Research estimate; not investment advice"],
             ]
         )
@@ -1916,6 +1922,7 @@ def build_workbook(
             "data_cutoff",
             "previous_close",
             "predicted_return",
+            "predicted_direction",
             "predicted_close",
             "lower_bound",
             "upper_bound",
@@ -1942,6 +1949,9 @@ def build_workbook(
             "model_name",
             "model_version",
             "selected",
+            "eligible_for_selection",
+            "selection_score",
+            "selection_reason",
             "validation_method",
             "validation_rows",
             "training_start",
@@ -1952,9 +1962,25 @@ def build_workbook(
             "rmse",
             "mape",
             "return_mae",
+            "return_bias",
+            "price_bias",
             "direction_accuracy",
+            "direction_f1",
             "interval_absolute_error",
+            "interval_coverage",
+            "interval_width",
+            "price_rmse_improvement_pct",
+            "direction_improvement_points",
+            "robustness_passed",
+            "robustness_windows_passed",
+            "robustness_windows_evaluated",
             "ridge_alpha",
+            "price_weight",
+            "direction_weight",
+            "minimum_price_improvement_pct",
+            "minimum_direction_improvement_points",
+            "max_price_deterioration_pct",
+            "max_direction_deterioration_points",
             "leakage_controls",
         ]
         _write_table(
@@ -1964,7 +1990,28 @@ def build_workbook(
         )
         _set_number_format(
             evaluation_sheet,
-            {"mae", "rmse", "mape", "return_mae", "direction_accuracy", "interval_absolute_error"},
+            {
+                "mae",
+                "rmse",
+                "mape",
+                "return_mae",
+                "return_bias",
+                "price_bias",
+                "direction_accuracy",
+                "direction_f1",
+                "interval_absolute_error",
+                "interval_coverage",
+                "interval_width",
+                "selection_score",
+                "price_rmse_improvement_pct",
+                "direction_improvement_points",
+                "price_weight",
+                "direction_weight",
+                "minimum_price_improvement_pct",
+                "minimum_direction_improvement_points",
+                "max_price_deterioration_pct",
+                "max_direction_deterioration_points",
+            },
             "0.0000",
         )
 
@@ -1981,7 +2028,10 @@ def build_workbook(
             "actual_close",
             "error",
             "absolute_error",
+            "predicted_direction",
+            "actual_direction",
             "direction_correct",
+            "signal",
             "training_samples",
         ]
         _write_table(
@@ -1995,6 +2045,69 @@ def build_workbook(
             "0.0000",
         )
         _set_number_format(backtest_sheet, {"predicted_return", "actual_return"}, "0.0000%")
+
+        robustness_sheet = workbook.create_sheet("模型稳健性")
+        robustness_headers = [
+            "model_name",
+            "model_version",
+            "validation_window",
+            "regime",
+            "validation_rows",
+            "mae",
+            "rmse",
+            "return_mae",
+            "direction_accuracy",
+            "direction_f1",
+            "interval_coverage",
+            "interval_width",
+            "robustness_status",
+        ]
+        _write_table(
+            robustness_sheet,
+            robustness_headers,
+            [[row[key] for key in robustness_headers] for row in forecast_result["robustness"]],
+        )
+        _set_number_format(
+            robustness_sheet,
+            {"mae", "rmse", "return_mae", "direction_accuracy", "direction_f1", "interval_coverage", "interval_width"},
+            "0.0000",
+        )
+
+        cost_sheet = workbook.create_sheet("成本敏感性")
+        cost_headers = [
+            "model_name",
+            "model_version",
+            "scenario",
+            "validation_rows",
+            "transaction_cost_bps",
+            "slippage_bps",
+            "cumulative_gross_return_pct",
+            "cumulative_net_return_pct",
+            "max_drawdown_pct",
+            "win_rate_pct",
+            "turnover",
+            "trade_count",
+            "total_cost_pct",
+        ]
+        _write_table(
+            cost_sheet,
+            cost_headers,
+            [[row[key] for key in cost_headers] for row in forecast_result["cost_evaluations"]],
+        )
+        _set_number_format(
+            cost_sheet,
+            {
+                "transaction_cost_bps",
+                "slippage_bps",
+                "cumulative_gross_return_pct",
+                "cumulative_net_return_pct",
+                "max_drawdown_pct",
+                "win_rate_pct",
+                "turnover",
+                "total_cost_pct",
+            },
+            "0.0000",
+        )
 
         contribution_sheet = workbook.create_sheet("特征贡献")
         contribution_headers = [
@@ -2061,6 +2174,9 @@ def build_workbook(
                 ["forecast", "training_price_rows", forecast_result["training_price_rows"], "clean online stage-two price rows"],
                 ["forecast", "training_samples", forecast_result["training_samples"], "leakage-controlled supervised samples"],
                 ["forecast", "validation_samples", forecast_result["validation_samples"], "walk-forward validation samples"],
+                ["forecast", "candidate_models", len(forecast_result["model_names"]), "candidate models evaluated"],
+                ["forecast", "robustness_rows", len(forecast_result["robustness"]), "window and volatility-regime evaluations"],
+                ["forecast", "cost_sensitivity_rows", len(forecast_result["cost_evaluations"]), "gross and net return scenarios"],
                 ["forecast", "status", forecast_result["status"], "forecast pipeline status"],
             ]
         )
@@ -2111,6 +2227,15 @@ def run_pipeline(
     forecast_minimum_history: int = 120,
     forecast_validation_points: int = 40,
     forecast_ridge_alpha: float = 1.0,
+    forecast_robustness_windows: Iterable[int] = (20, 40, 80),
+    forecast_price_weight: float = 0.65,
+    forecast_direction_weight: float = 0.35,
+    forecast_min_price_improvement_pct: float = 2.0,
+    forecast_min_direction_improvement_points: float = 5.0,
+    forecast_max_price_deterioration_pct: float = 1.0,
+    forecast_max_direction_deterioration_points: float = 5.0,
+    forecast_transaction_cost_bps: float = 10.0,
+    forecast_slippage_bps: float = 5.0,
     cross_validate_prices: bool = False,
     cross_validation_tolerance_pct: float = 1.0,
     timeout: int = 20,
@@ -2363,6 +2488,15 @@ def run_pipeline(
                 minimum_history=forecast_minimum_history,
                 validation_points=forecast_validation_points,
                 ridge_alpha=forecast_ridge_alpha,
+                robustness_windows=forecast_robustness_windows,
+                price_weight=forecast_price_weight,
+                direction_weight=forecast_direction_weight,
+                minimum_price_improvement_pct=forecast_min_price_improvement_pct,
+                minimum_direction_improvement_points=forecast_min_direction_improvement_points,
+                max_price_deterioration_pct=forecast_max_price_deterioration_pct,
+                max_direction_deterioration_points=forecast_max_direction_deterioration_points,
+                transaction_cost_bps=forecast_transaction_cost_bps,
+                slippage_bps=forecast_slippage_bps,
                 market=instrument["market"],
                 currency=instrument["currency"],
             )
@@ -2467,6 +2601,8 @@ def run_pipeline(
         "forecast_status": forecast_result["status"] if forecast_result else "not_requested",
         "forecast_rows": len(forecast_result["forecasts"]) if forecast_result else 0,
         "selected_model": forecast_result["selected_model"] if forecast_result else "",
+        "selected_model_version": forecast_result["selected_model_version"] if forecast_result else "",
+        "forecast_candidate_models": ", ".join(forecast_result["model_names"]) if forecast_result else "",
         "forecast_data_cutoff": forecast_result["data_cutoff"] if forecast_result else "",
         "forecast_validation_samples": forecast_result["validation_samples"] if forecast_result else 0,
         "latest_price_date": prices[-1]["date"] if prices else "",
@@ -2510,11 +2646,20 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--cache-dir", type=Path, default=DEFAULT_CACHE_DIR)
     parser.add_argument("--refresh-cache", action="store_true")
     parser.add_argument("--announcement-limit", type=int, default=40)
-    parser.add_argument("--forecast", action="store_true", help="run stage-three forecasting from real online stage-two data")
+    parser.add_argument("--forecast", action="store_true", help="run stage-five forecasting and model selection from real online stage-two data")
     parser.add_argument("--forecast-horizon", type=int, default=5, help="future trading steps, from 1 to 20")
     parser.add_argument("--forecast-minimum-history", type=int, default=120, help="minimum clean price rows required")
     parser.add_argument("--forecast-validation-points", type=int, default=40, help="walk-forward validation rows")
     parser.add_argument("--forecast-ridge-alpha", type=float, default=1.0, help="positive ridge regularization strength")
+    parser.add_argument("--forecast-robustness-windows", type=int, nargs="+", default=[20, 40, 80], help="validation windows used for robustness checks")
+    parser.add_argument("--forecast-price-weight", type=float, default=0.65, help="selection weight for price-error score")
+    parser.add_argument("--forecast-direction-weight", type=float, default=0.35, help="selection weight for direction score")
+    parser.add_argument("--forecast-min-price-improvement-pct", type=float, default=2.0, help="minimum ridge price RMSE improvement percentage")
+    parser.add_argument("--forecast-min-direction-improvement-points", type=float, default=5.0, help="minimum ridge direction improvement in percentage points")
+    parser.add_argument("--forecast-max-price-deterioration-pct", type=float, default=1.0, help="maximum allowed price RMSE deterioration percentage")
+    parser.add_argument("--forecast-max-direction-deterioration-points", type=float, default=5.0, help="maximum allowed direction deterioration in percentage points")
+    parser.add_argument("--forecast-transaction-cost-bps", type=float, default=10.0, help="base transaction cost in basis points")
+    parser.add_argument("--forecast-slippage-bps", type=float, default=5.0, help="slippage in basis points")
     parser.add_argument("--cross-validate-prices", action="store_true", help="compare primary closes with a secondary source when supported")
     parser.add_argument("--cross-validation-tolerance-pct", type=float, default=1.0, help="allowed close difference percentage")
     parser.add_argument("--timeout", type=int, default=20)
@@ -2547,6 +2692,15 @@ def main(argv: list[str] | None = None) -> int:
             forecast_minimum_history=args.forecast_minimum_history,
             forecast_validation_points=args.forecast_validation_points,
             forecast_ridge_alpha=args.forecast_ridge_alpha,
+            forecast_robustness_windows=args.forecast_robustness_windows,
+            forecast_price_weight=args.forecast_price_weight,
+            forecast_direction_weight=args.forecast_direction_weight,
+            forecast_min_price_improvement_pct=args.forecast_min_price_improvement_pct,
+            forecast_min_direction_improvement_points=args.forecast_min_direction_improvement_points,
+            forecast_max_price_deterioration_pct=args.forecast_max_price_deterioration_pct,
+            forecast_max_direction_deterioration_points=args.forecast_max_direction_deterioration_points,
+            forecast_transaction_cost_bps=args.forecast_transaction_cost_bps,
+            forecast_slippage_bps=args.forecast_slippage_bps,
             cross_validate_prices=args.cross_validate_prices,
             cross_validation_tolerance_pct=args.cross_validation_tolerance_pct,
             timeout=args.timeout,

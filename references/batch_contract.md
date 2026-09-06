@@ -1,4 +1,4 @@
-# Stage-Four Batch Contract
+# Stage-Five Batch Contract
 
 Read this reference for multi-stock, portfolio, industry, theme, or repeatable task requests.
 
@@ -14,10 +14,10 @@ Supported task types:
 
 ## Manifest
 
-The manifest is YAML or JSON and uses batch contract version `1.0`.
+The manifest is YAML or JSON and uses batch contract version `2.0`.
 
 ```yaml
-version: "1.0"
+version: "2.0"
 name: example-comparison
 task_type: industry
 group: example-group
@@ -26,6 +26,15 @@ start_date: 2024-01-01
 end_date: latest
 forecast: true
 forecast_horizon: 5
+forecast_robustness_windows: [20, 40, 80]
+forecast_price_weight: 0.65
+forecast_direction_weight: 0.35
+forecast_min_price_improvement_pct: 2.0
+forecast_min_direction_improvement_points: 5.0
+forecast_max_price_deterioration_pct: 1.0
+forecast_max_direction_deterioration_points: 5.0
+forecast_transaction_cost_bps: 10.0
+forecast_slippage_bps: 5.0
 cross_validate_prices: true
 cross_validation_tolerance_pct: 1.0
 output_dir: outputs/example
@@ -49,7 +58,7 @@ items:
 
 Rules:
 
-- `version` must equal `1.0`.
+- `version` must equal `2.0`.
 - `name`, `task_type`, and at least one item are required.
 - A manifest supports at most 50 unique normalized stock identities.
 - `mode` is `fixture` or `online`; formal forecasts require `online`.
@@ -75,7 +84,7 @@ The batch workbook contains:
 | --- | --- |
 | `README` | Task type, mode, constituent policy, completion status, and batch contract version. |
 | `主体任务` | Label, group, normalized symbol, market, attempts, per-item output, and isolated error. |
-| `横向比较` | Latest close, period return, volatility, financial ratios, news tone, data coverage, selected forecast, forecast interval, source cross-check status, and item status. |
+| `横向比较` | Latest close, period return, volatility, financial ratios, news tone, data coverage, selected model and version, candidate models, forecast interval, source cross-check status, and item status. |
 | `版本信息` | Skill, contracts, source adapters, forecast engine, models, and workbook template versions. |
 
 The summary workbook is for cross-sectional review. Detailed prices, financial statements, news, notices, model evaluation, and backtests remain in each stock workbook.

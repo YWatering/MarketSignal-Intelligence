@@ -1,7 +1,7 @@
 interface:
   display_name: "MarketSignal Intelligence"
   short_description: "Research and compare stocks with real data and forecasts"
-  default_prompt: "Use $market-signal-intelligence to research or compare specified China or US stocks from real data, validate sources, run explainable forecasts when requested, and export traceable Excel reports."
+  default_prompt: "Use $market-signal-intelligence to research or compare specified China or US stocks from real data, validate sources, run explainable multi-model forecasts when requested, and export traceable Excel reports."
 
 policy:
   allow_implicit_invocation: true

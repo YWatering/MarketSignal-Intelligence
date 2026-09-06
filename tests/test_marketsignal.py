@@ -406,11 +406,14 @@ class MarketSignalTests(unittest.TestCase):
             currency="CNY",
         )
         self.assertEqual("pass", result["status"])
-        self.assertEqual(6, len(result["forecasts"]))
-        self.assertEqual(2, len(result["evaluations"]))
-        self.assertEqual(40, len(result["backtest"]))
-        self.assertEqual(14, len(result["feature_contributions"]))
-        self.assertIn(result["selected_model"], {"last_close_baseline", "multisignal_ridge"})
+        self.assertEqual(15, len(result["forecasts"]))
+        self.assertEqual(5, len(result["evaluations"]))
+        self.assertEqual(100, len(result["backtest"]))
+        self.assertEqual(15, len(result["feature_contributions"]))
+        self.assertIn(result["selected_model"], set(result["model_names"]))
+        self.assertEqual(1, sum(row["selected"] for row in result["evaluations"]))
+        self.assertTrue(result["robustness"])
+        self.assertEqual(15, len(result["cost_evaluations"]))
         self.assertTrue(all(row["lower_bound"] <= row["predicted_close"] <= row["upper_bound"] for row in result["forecasts"]))
 
     def test_forecast_analysis_rejects_fixture_price_sources(self) -> None:
@@ -449,9 +452,9 @@ class MarketSignalTests(unittest.TestCase):
             currency="CNY",
         )
         self.assertEqual(30, result["validation_samples"])
-        self.assertEqual(60, len(result["backtest"]))
+        self.assertEqual(150, len(result["backtest"]))
 
-    def test_online_pipeline_writes_stage_three_workbook(self) -> None:
+    def test_online_pipeline_writes_stage_five_workbook(self) -> None:
         prices = _forecast_prices()
         entity = {
             "symbol": "600519.SH",
@@ -499,7 +502,7 @@ class MarketSignalTests(unittest.TestCase):
                 forecast_validation_points=20,
             )
             self.assertEqual("pass", summary["forecast_status"])
-            self.assertEqual(6, summary["forecast_rows"])
+            self.assertEqual(15, summary["forecast_rows"])
             workbook = load_workbook(output, data_only=True)
             self.assertEqual(
                 [
@@ -513,6 +516,8 @@ class MarketSignalTests(unittest.TestCase):
                     "预测结果",
                     "模型评估",
                     "回测明细",
+                    "模型稳健性",
+                    "成本敏感性",
                     "特征贡献",
                     "数据来源",
                     "数据质量",
@@ -521,9 +526,11 @@ class MarketSignalTests(unittest.TestCase):
                 workbook.sheetnames,
             )
             self.assertGreater(workbook["预测结果"].max_row, 1)
-            self.assertEqual(3, workbook["模型评估"].max_row)
+            self.assertEqual(6, workbook["模型评估"].max_row)
             self.assertGreater(workbook["回测明细"].max_row, 1)
-            self.assertEqual(15, workbook["特征贡献"].max_row)
+            self.assertGreater(workbook["模型稳健性"].max_row, 1)
+            self.assertEqual(16, workbook["成本敏感性"].max_row)
+            self.assertEqual(16, workbook["特征贡献"].max_row)
 
     def test_sec_user_agent_and_url_redaction(self) -> None:
         self.assertEqual(

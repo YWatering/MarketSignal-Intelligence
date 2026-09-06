@@ -163,6 +163,53 @@ def validate_manifest(payload: dict[str, Any]) -> dict[str, Any]:
     forecast_ridge_alpha = float(
         _number_setting(payload.get("forecast_ridge_alpha", 1.0), "forecast_ridge_alpha", float)
     )
+    robustness_value = payload.get("forecast_robustness_windows", [20, 40, 80])
+    if not isinstance(robustness_value, list) or not robustness_value:
+        raise BatchError("forecast_robustness_windows must be a non-empty list")
+    try:
+        forecast_robustness_windows = [int(value) for value in robustness_value]
+    except (TypeError, ValueError) as exc:
+        raise BatchError("forecast_robustness_windows must contain integers") from exc
+    forecast_price_weight = float(
+        _number_setting(payload.get("forecast_price_weight", 0.65), "forecast_price_weight", float)
+    )
+    forecast_direction_weight = float(
+        _number_setting(payload.get("forecast_direction_weight", 0.35), "forecast_direction_weight", float)
+    )
+    forecast_min_price_improvement_pct = float(
+        _number_setting(
+            payload.get("forecast_min_price_improvement_pct", 2.0),
+            "forecast_min_price_improvement_pct",
+            float,
+        )
+    )
+    forecast_min_direction_improvement_points = float(
+        _number_setting(
+            payload.get("forecast_min_direction_improvement_points", 5.0),
+            "forecast_min_direction_improvement_points",
+            float,
+        )
+    )
+    forecast_max_price_deterioration_pct = float(
+        _number_setting(
+            payload.get("forecast_max_price_deterioration_pct", 1.0),
+            "forecast_max_price_deterioration_pct",
+            float,
+        )
+    )
+    forecast_max_direction_deterioration_points = float(
+        _number_setting(
+            payload.get("forecast_max_direction_deterioration_points", 5.0),
+            "forecast_max_direction_deterioration_points",
+            float,
+        )
+    )
+    forecast_transaction_cost_bps = float(
+        _number_setting(payload.get("forecast_transaction_cost_bps", 10.0), "forecast_transaction_cost_bps", float)
+    )
+    forecast_slippage_bps = float(
+        _number_setting(payload.get("forecast_slippage_bps", 5.0), "forecast_slippage_bps", float)
+    )
     cross_validation_tolerance_pct = float(
         _number_setting(
             payload.get("cross_validation_tolerance_pct", 1.0),
@@ -178,6 +225,22 @@ def validate_manifest(payload: dict[str, Any]) -> dict[str, Any]:
         raise BatchError("forecast_validation_points must be at least 10")
     if forecast_ridge_alpha <= 0:
         raise BatchError("forecast_ridge_alpha must be greater than zero")
+    if any(window < 10 for window in forecast_robustness_windows):
+        raise BatchError("forecast_robustness_windows must contain values of at least 10")
+    if forecast_price_weight < 0 or forecast_direction_weight < 0 or forecast_price_weight + forecast_direction_weight <= 0:
+        raise BatchError("forecast selection weights must be non-negative with a positive sum")
+    if any(
+        value < 0
+        for value in (
+            forecast_min_price_improvement_pct,
+            forecast_min_direction_improvement_points,
+            forecast_max_price_deterioration_pct,
+            forecast_max_direction_deterioration_points,
+            forecast_transaction_cost_bps,
+            forecast_slippage_bps,
+        )
+    ):
+        raise BatchError("forecast thresholds and costs cannot be negative")
     if cross_validation_tolerance_pct <= 0:
         raise BatchError("cross_validation_tolerance_pct must be greater than zero")
     return {
@@ -203,6 +266,15 @@ def validate_manifest(payload: dict[str, Any]) -> dict[str, Any]:
         "forecast_minimum_history": forecast_minimum_history,
         "forecast_validation_points": forecast_validation_points,
         "forecast_ridge_alpha": forecast_ridge_alpha,
+        "forecast_robustness_windows": forecast_robustness_windows,
+        "forecast_price_weight": forecast_price_weight,
+        "forecast_direction_weight": forecast_direction_weight,
+        "forecast_min_price_improvement_pct": forecast_min_price_improvement_pct,
+        "forecast_min_direction_improvement_points": forecast_min_direction_improvement_points,
+        "forecast_max_price_deterioration_pct": forecast_max_price_deterioration_pct,
+        "forecast_max_direction_deterioration_points": forecast_max_direction_deterioration_points,
+        "forecast_transaction_cost_bps": forecast_transaction_cost_bps,
+        "forecast_slippage_bps": forecast_slippage_bps,
         "cross_validate_prices": bool(payload.get("cross_validate_prices", mode == "online")),
         "cross_validation_tolerance_pct": cross_validation_tolerance_pct,
     }
@@ -278,6 +350,8 @@ def _build_batch_workbook(config: dict[str, Any], results: list[dict[str, Any]],
         "announcement_rows",
         "forecast_status",
         "selected_model",
+        "selected_model_version",
+        "forecast_candidate_models",
         "selected_forecast_close",
         "forecast_lower_bound",
         "forecast_upper_bound",
@@ -310,6 +384,8 @@ def _build_batch_workbook(config: dict[str, Any], results: list[dict[str, Any]],
                 summary.get("announcement_rows", 0),
                 summary.get("forecast_status", ""),
                 summary.get("selected_model", ""),
+                summary.get("selected_model_version", ""),
+                summary.get("forecast_candidate_models", ""),
                 summary.get("selected_forecast_close", ""),
                 summary.get("forecast_lower_bound", ""),
                 summary.get("forecast_upper_bound", ""),
@@ -406,6 +482,15 @@ def run_batch(
                 forecast_minimum_history=config["forecast_minimum_history"],
                 forecast_validation_points=config["forecast_validation_points"],
                 forecast_ridge_alpha=config["forecast_ridge_alpha"],
+                forecast_robustness_windows=config["forecast_robustness_windows"],
+                forecast_price_weight=config["forecast_price_weight"],
+                forecast_direction_weight=config["forecast_direction_weight"],
+                forecast_min_price_improvement_pct=config["forecast_min_price_improvement_pct"],
+                forecast_min_direction_improvement_points=config["forecast_min_direction_improvement_points"],
+                forecast_max_price_deterioration_pct=config["forecast_max_price_deterioration_pct"],
+                forecast_max_direction_deterioration_points=config["forecast_max_direction_deterioration_points"],
+                forecast_transaction_cost_bps=config["forecast_transaction_cost_bps"],
+                forecast_slippage_bps=config["forecast_slippage_bps"],
                 cross_validate_prices=config["cross_validate_prices"],
                 cross_validation_tolerance_pct=config["cross_validation_tolerance_pct"],
             )
