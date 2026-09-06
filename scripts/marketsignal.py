@@ -32,6 +32,8 @@ from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 
 from forecasting import ForecastError, run_forecast_analysis
+from operations import compare_price_sources
+from versioning import SOURCE_ADAPTER_VERSION, component_versions
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -49,7 +51,7 @@ SEC_TICKERS_URL = "https://www.sec.gov/files/company_tickers.json"
 SEC_COMPANYFACTS_URL = "https://data.sec.gov/api/xbrl/companyfacts"
 SEC_SUBMISSIONS_URL = "https://data.sec.gov/submissions"
 
-USER_AGENT = "MarketSignal-Intelligence/0.2"
+USER_AGENT = f"MarketSignal-Intelligence/{SOURCE_ADAPTER_VERSION}"
 DATE_FORMAT = "%Y-%m-%d"
 SEC_FORMS = {"10-K", "10-Q", "8-K"}
 CHINA_MARKETS = {"cn_a", "cn_b", "hk"}
@@ -1027,6 +1029,80 @@ def fetch_online_china_prices(
     )
 
 
+def fetch_online_china_secondary_prices(
+    instrument: dict[str, str],
+    start_date: str | None,
+    end_date: str | None,
+    cache_dir: Path | None,
+    refresh_cache: bool,
+    primary_provider: str,
+) -> tuple[list[dict[str, Any]], str, str, str]:
+    ak = _akshare_module()
+    start = _date_argument(start_date, "1970-01-01")
+    end = _date_argument(end_date, "2050-01-01")
+    if instrument["market"] == "cn_a":
+        if primary_provider == "AKShare stock_zh_a_hist":
+            candidates = [
+                (
+                    "stock_zh_a_hist_tx",
+                    lambda: ak.stock_zh_a_hist_tx(
+                        f"{instrument['exchange_prefix'].lower()}{instrument['code']}", start, end, ""
+                    ),
+                ),
+                (
+                    "stock_zh_a_daily",
+                    lambda: ak.stock_zh_a_daily(
+                        f"{instrument['exchange_prefix'].lower()}{instrument['code']}", start, end, ""
+                    ),
+                ),
+            ]
+        else:
+            candidates = [
+                (
+                    "stock_zh_a_daily",
+                    lambda: ak.stock_zh_a_daily(
+                        f"{instrument['exchange_prefix'].lower()}{instrument['code']}", start, end, ""
+                    ),
+                ),
+                (
+                    "stock_zh_a_hist",
+                    lambda: ak.stock_zh_a_hist(instrument["code"], "daily", start, end, "", 20),
+                ),
+            ]
+    elif instrument["market"] == "hk":
+        if primary_provider == "AKShare stock_hk_hist":
+            candidates = [("stock_hk_daily", lambda: ak.stock_hk_daily(instrument["code"], ""))]
+        else:
+            candidates = [
+                ("stock_hk_hist", lambda: ak.stock_hk_hist(instrument["code"], "daily", start, end, ""))
+            ]
+    else:
+        raise PipelineError(f"no secondary price adapter is configured for {instrument['market']}")
+    errors: list[str] = []
+    for function_name, loader in candidates:
+        try:
+            frame, cache_status = _fetch_akshare_table(
+                function_name,
+                f"price-crosscheck:{instrument['market']}:{instrument['provider_symbol']}:{start}:{end}:{function_name}",
+                loader,
+                cache_dir,
+                refresh_cache,
+            )
+            if len(frame.index) == 0:
+                errors.append(f"AKShare {function_name} returned no rows")
+                continue
+            provider = f"AKShare {function_name}"
+            return (
+                _normalize_dataframe_price_rows(frame, provider, instrument["market"], instrument["currency"]),
+                AKSHARE_DOC_URL,
+                cache_status,
+                provider,
+            )
+        except PipelineError as exc:
+            errors.append(str(exc))
+    raise PipelineError("; ".join(errors) or "secondary price adapters returned no usable rows")
+
+
 def fetch_online_china_news(
     instrument: dict[str, str],
     cache_dir: Path | None,
@@ -1736,6 +1812,7 @@ def build_workbook(
     source_records: list[dict[str, Any]],
     pipeline_status: str,
     forecast_result: dict[str, Any] | None = None,
+    cross_validation: dict[str, Any] | None = None,
 ) -> None:
     workbook = Workbook()
     workbook.remove(workbook.active)
@@ -1760,8 +1837,12 @@ def build_workbook(
         ["announcement_rows", len(announcements), "Rows after cleaning and range filtering"],
         ["indicator_rows", len(indicators), "Derived market, financial, news, and filing indicators"],
         ["forecast_status", forecast_result["status"] if forecast_result else "not requested", "Forecasting requires online stage-two data"],
+        ["cross_validation_status", cross_validation["status"] if cross_validation else "not requested", "Optional secondary-source close comparison"],
         ["limitations", "Rule-based news tone is not investment advice", "Financial coverage varies by market adapter"],
     ]
+    readme_rows.extend(
+        [[f"version_{component}", version, "Central component version registry"] for component, version in component_versions().items()]
+    )
     if forecast_result:
         readme_rows.extend(
             [
@@ -1937,6 +2018,30 @@ def build_workbook(
             "0.0000",
         )
 
+    if cross_validation:
+        cross_validation_sheet = workbook.create_sheet("交叉校验")
+        cross_validation_headers = [
+            "status",
+            "primary_provider",
+            "secondary_provider",
+            "overlap_rows",
+            "mean_close_difference_pct",
+            "max_close_difference_pct",
+            "outside_tolerance_rows",
+            "tolerance_pct",
+            "notes",
+        ]
+        _write_table(
+            cross_validation_sheet,
+            cross_validation_headers,
+            [[cross_validation.get(key, "") for key in cross_validation_headers]],
+        )
+        _set_number_format(
+            cross_validation_sheet,
+            {"mean_close_difference_pct", "max_close_difference_pct", "tolerance_pct"},
+            "0.0000",
+        )
+
     source_sheet = workbook.create_sheet("数据来源")
     _write_table(
         source_sheet,
@@ -1959,9 +2064,24 @@ def build_workbook(
                 ["forecast", "status", forecast_result["status"], "forecast pipeline status"],
             ]
         )
+    if cross_validation:
+        quality_rows.extend(
+            [
+                ["price_cross_validation", "status", cross_validation["status"], cross_validation["notes"]],
+                ["price_cross_validation", "overlap_rows", cross_validation.get("overlap_rows", 0), "overlapping close observations"],
+                ["price_cross_validation", "outside_tolerance_rows", cross_validation.get("outside_tolerance_rows", 0), "rows above tolerance"],
+            ]
+        )
     quality_rows.append(["pipeline", "status", pipeline_status, "warning means one or more required datasets have no clean rows"])
     quality_sheet = workbook.create_sheet("数据质量")
     _write_table(quality_sheet, ["dataset", "metric", "value", "notes"], quality_rows)
+
+    version_sheet = workbook.create_sheet("版本信息")
+    _write_table(
+        version_sheet,
+        ["component", "version", "notes"],
+        [[component, version, "central version registry"] for component, version in component_versions().items()],
+    )
 
     output.parent.mkdir(parents=True, exist_ok=True)
     workbook.save(output)
@@ -1991,9 +2111,13 @@ def run_pipeline(
     forecast_minimum_history: int = 120,
     forecast_validation_points: int = 40,
     forecast_ridge_alpha: float = 1.0,
+    cross_validate_prices: bool = False,
+    cross_validation_tolerance_pct: float = 1.0,
     timeout: int = 20,
 ) -> dict[str, Any]:
     _validate_request(symbol, start_date, end_date, mode, output, announcement_limit)
+    if cross_validation_tolerance_pct <= 0:
+        raise PipelineError("cross-validation tolerance must be greater than zero")
     if forecast and mode != "online":
         raise PipelineError("forecasting requires online mode and real stage-two source data")
     instrument = parse_symbol(symbol, market)
@@ -2155,6 +2279,78 @@ def run_pipeline(
     news_quality["output_rows"] = len(news)
     announcement_quality["output_rows"] = len(announcements)
 
+    cross_validation: dict[str, Any] | None = None
+    if cross_validate_prices:
+        if mode != "online":
+            cross_validation = {
+                "status": "not_supported",
+                "primary_provider": price_provider,
+                "secondary_provider": "not configured",
+                "overlap_rows": 0,
+                "mean_close_difference_pct": None,
+                "max_close_difference_pct": None,
+                "outside_tolerance_rows": 0,
+                "tolerance_pct": cross_validation_tolerance_pct,
+                "notes": "price cross-validation requires online source adapters",
+            }
+        elif instrument["market"] not in {"cn_a", "hk"}:
+            cross_validation = {
+                "status": "not_supported",
+                "primary_provider": price_provider,
+                "secondary_provider": "not configured",
+                "overlap_rows": 0,
+                "mean_close_difference_pct": None,
+                "max_close_difference_pct": None,
+                "outside_tolerance_rows": 0,
+                "tolerance_pct": cross_validation_tolerance_pct,
+                "notes": f"no secondary price adapter is configured for {instrument['market']}",
+            }
+        else:
+            try:
+                raw_secondary_prices, secondary_location, secondary_cache, secondary_provider = (
+                    fetch_online_china_secondary_prices(
+                        instrument,
+                        start_date,
+                        end_date,
+                        cache_dir,
+                        refresh_cache,
+                        price_provider,
+                    )
+                )
+                secondary_prices, secondary_quality = clean_prices(raw_secondary_prices)
+                secondary_prices, secondary_quality["out_of_range"] = filter_prices_by_range(
+                    secondary_prices, start_date, end_date
+                )
+                secondary_quality["output_rows"] = len(secondary_prices)
+                cross_validation = compare_price_sources(
+                    prices,
+                    secondary_prices,
+                    primary_provider=price_provider,
+                    secondary_provider=secondary_provider,
+                    tolerance_pct=cross_validation_tolerance_pct,
+                )
+                cross_validation.update(
+                    {
+                        "source_location": secondary_location,
+                        "cache_status": secondary_cache,
+                        "secondary_raw_rows": secondary_quality["raw_rows"],
+                        "secondary_clean_rows": secondary_quality["clean_rows"],
+                        "secondary_output_rows": secondary_quality["output_rows"],
+                    }
+                )
+            except PipelineError as exc:
+                cross_validation = {
+                    "status": "error",
+                    "primary_provider": price_provider,
+                    "secondary_provider": "secondary adapter failed",
+                    "overlap_rows": 0,
+                    "mean_close_difference_pct": None,
+                    "max_close_difference_pct": None,
+                    "outside_tolerance_rows": 0,
+                    "tolerance_pct": cross_validation_tolerance_pct,
+                    "notes": str(exc),
+                }
+
     forecast_result: dict[str, Any] | None = None
     if forecast:
         try:
@@ -2199,9 +2395,28 @@ def run_pipeline(
                 "currency": instrument["currency"],
             }
         )
+    if cross_validation:
+        source_records.append(
+            {
+                "dataset": "price_cross_validation",
+                "provider": cross_validation["secondary_provider"],
+                "mode": mode,
+                "status": cross_validation["status"],
+                "cache_status": cross_validation.get("cache_status", "not_applicable"),
+                "source_location": cross_validation.get("source_location", "not configured"),
+                "raw_rows": cross_validation.get("secondary_raw_rows", 0),
+                "clean_rows": cross_validation.get("secondary_clean_rows", 0),
+                "output_rows": cross_validation.get("secondary_output_rows", 0),
+                "notes": cross_validation["notes"],
+                "market": instrument["market"],
+                "currency": instrument["currency"],
+            }
+        )
 
     required_sets = {"prices": prices, "financials": financials, "news": news}
     pipeline_status = "pass" if all(required_sets.values()) else "warning"
+    if cross_validation and cross_validation["status"] in {"warning", "error", "insufficient_overlap"}:
+        pipeline_status = "warning"
     indicators = build_indicators(prices, financials, news, announcements)
     qualities = {
         "prices": price_quality,
@@ -2225,7 +2440,17 @@ def run_pipeline(
         source_records,
         pipeline_status,
         forecast_result,
+        cross_validation,
     )
+    selected_forecast = next(
+        (
+            row
+            for row in (forecast_result["forecasts"] if forecast_result else [])
+            if row["selected"] and row["forecast_step"] == 1
+        ),
+        None,
+    )
+    indicator_values = {row["indicator"]: row["value"] for row in indicators}
     return {
         "symbol": normalized_symbol,
         "company_name": entity["company_name"],
@@ -2244,6 +2469,21 @@ def run_pipeline(
         "selected_model": forecast_result["selected_model"] if forecast_result else "",
         "forecast_data_cutoff": forecast_result["data_cutoff"] if forecast_result else "",
         "forecast_validation_samples": forecast_result["validation_samples"] if forecast_result else 0,
+        "latest_price_date": prices[-1]["date"] if prices else "",
+        "latest_close": prices[-1]["close"] if prices else None,
+        "period_return_pct": indicator_values.get("period_return"),
+        "close_return_volatility_pct": indicator_values.get("close_return_volatility"),
+        "net_profit_margin_pct": indicator_values.get("net_profit_margin"),
+        "current_ratio": indicator_values.get("current_ratio"),
+        "operating_cash_flow_margin_pct": indicator_values.get("operating_cash_flow_margin"),
+        "positive_news_count": indicator_values.get("positive_news_count", 0),
+        "negative_news_count": indicator_values.get("negative_news_count", 0),
+        "news_tone_balance": indicator_values.get("news_tone_balance", 0),
+        "selected_forecast_close": selected_forecast["predicted_close"] if selected_forecast else None,
+        "forecast_lower_bound": selected_forecast["lower_bound"] if selected_forecast else None,
+        "forecast_upper_bound": selected_forecast["upper_bound"] if selected_forecast else None,
+        "cross_validation_status": cross_validation["status"] if cross_validation else "not_requested",
+        "component_versions": component_versions(),
         "qualities": qualities,
         # Keep stage-one summary keys available to existing callers.
         "price_quality": price_quality,
@@ -2275,6 +2515,8 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--forecast-minimum-history", type=int, default=120, help="minimum clean price rows required")
     parser.add_argument("--forecast-validation-points", type=int, default=40, help="walk-forward validation rows")
     parser.add_argument("--forecast-ridge-alpha", type=float, default=1.0, help="positive ridge regularization strength")
+    parser.add_argument("--cross-validate-prices", action="store_true", help="compare primary closes with a secondary source when supported")
+    parser.add_argument("--cross-validation-tolerance-pct", type=float, default=1.0, help="allowed close difference percentage")
     parser.add_argument("--timeout", type=int, default=20)
     return parser
 
@@ -2305,6 +2547,8 @@ def main(argv: list[str] | None = None) -> int:
             forecast_minimum_history=args.forecast_minimum_history,
             forecast_validation_points=args.forecast_validation_points,
             forecast_ridge_alpha=args.forecast_ridge_alpha,
+            cross_validate_prices=args.cross_validate_prices,
+            cross_validation_tolerance_pct=args.cross_validation_tolerance_pct,
             timeout=args.timeout,
         )
     except PipelineError as exc:

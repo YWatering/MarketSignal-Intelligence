@@ -9,14 +9,16 @@ from typing import Any, Iterable
 
 import numpy as np
 
+from versioning import BASELINE_MODEL_VERSION, RIDGE_MODEL_VERSION
+
 
 DATE_FORMAT = "%Y-%m-%d"
 FEATURE_WINDOW = 21
 MIN_TRAINING_SAMPLES = 40
 BASELINE_MODEL = "last_close_baseline"
-BASELINE_VERSION = "persistence-v1"
+BASELINE_VERSION = BASELINE_MODEL_VERSION
 RIDGE_MODEL = "multisignal_ridge"
-RIDGE_VERSION = "ridge-v1"
+RIDGE_VERSION = RIDGE_MODEL_VERSION
 INTERVAL_LEVEL = 90
 
 FEATURE_DESCRIPTIONS = {

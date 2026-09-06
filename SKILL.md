@@ -1,17 +1,17 @@
 ---
 name: market-signal-intelligence
-description: Collect real online single-stock data across China A shares, China B shares, Hong Kong stocks, and US stocks; clean prices, financial statements, notices, and news; run leakage-aware backtesting and price forecasts; export traceable Excel workbooks. Use when users request Chinese or US single-stock research, financial data, market sentiment, Excel reports, or explainable price forecasts.
+description: Collect and compare real stock data across China A shares, China B shares, Hong Kong stocks, and US stocks; clean prices, financial statements, notices, and news; validate sources; run leakage-aware forecasts; export single-stock or multi-stock Excel workbooks. Use for stock, portfolio, user-defined industry or theme research, repeatable task manifests, market sentiment, or explainable price forecasts.
 metadata:
-  short-description: Real-data stock research, backtesting, and forecasts to Excel
+  short-description: Real-data stock research, comparison, and forecasts to Excel
 ---
 
 # MarketSignal Intelligence
 
-Use this skill for repeatable market-research workflows involving one stock, its market data, financial statements, notices, and related news.
+Use this skill for repeatable market-research workflows involving one or more explicitly identified stocks, their market data, financial statements, notices, and related news.
 
 ## Current Stage
 
-Stage three provides all stage-two collection and governance capabilities plus:
+Stage four provides all earlier collection, governance, and forecasting capabilities plus:
 
 - A structured input contract for one stock, one market, and an optional date range.
 - Symbol parsing for China A shares (`cn_a`), China B shares (`cn_b`), Hong Kong stocks (`hk`), and US stocks (`us`).
@@ -26,19 +26,24 @@ Stage three provides all stage-two collection and governance capabilities plus:
 - Features derived from cleaned online prices, financial filings, news tone, and notices produced by the same stage-two run.
 - Expanding-window one-step-ahead walk-forward validation with MAE, RMSE, MAPE, return MAE, and direction accuracy.
 - Model selection by validation RMSE, future point forecasts, empirical prediction intervals, actual-versus-predicted backtest rows, and standardized feature coefficients.
+- Versioned manifests for multi-stock portfolios and user-defined industry or theme baskets.
+- Per-item retries, failure isolation, structured JSONL logs, and interval-based repeatable execution state.
+- Optional primary-versus-secondary price validation for China A shares and Hong Kong stocks.
+- Central versions for the Skill, contracts, source adapters, forecast engine, models, and Excel templates.
 
-Stage three does not provide causal claims, guaranteed returns, advanced sentiment models, multi-stock comparison, exchange-holiday calendars, or scheduled research. Do not present a forecast as investment advice or certainty.
+Stage four does not automatically discover industry or theme constituents, run an always-on scheduler, provide causal claims, guarantee returns, implement advanced sentiment models, or apply exchange-holiday calendars. Do not present a forecast as investment advice or certainty.
 
 ## Workflow
 
-1. Parse the requested symbol, market, date range, data mode, and output path. Infer the market only when the symbol format is unambiguous; otherwise ask for `cn_a`, `cn_b`, `hk`, or `us`.
-2. Read [references/data_contract.md](references/data_contract.md) before changing fields, market routing, or output sheets. For prediction requests, also read [references/forecasting.md](references/forecasting.md).
-3. Use online mode for current Chinese-market research when AKShare and network access are available. Use online US mode only when the Twelve Data key, SEC User-Agent, and required network access are available.
-4. Run `scripts/marketsignal.py` with the normalized symbol and explicit `--market` when useful. Add `--forecast` only in online mode and use a date range long enough to provide at least the configured minimum history.
-5. For Chinese markets, use AKShare adapters and inspect the returned source and cache status. For US markets, provide `MARKETSIGNAL_SEC_USER_AGENT` or `--sec-user-agent` with an application name and contact email, and provide `MARKETSIGNAL_TWELVE_DATA_API_KEY` for Twelve Data.
-6. For forecasting, use only records returned and cleaned by the current stage-two run. Reject fixture rows, enforce point-in-time availability, and keep future external features fixed at the last real data cutoff.
-7. Treat missing, invalid, duplicated, out-of-range, unsupported, source-failed, or insufficient-history records as quality signals. Do not silently replace unavailable data with guesses.
-8. Deliver the workbook path and summarize market, currency, data cutoff, row counts, selected model, validation metrics, forecast interval, source status, limitations, and quality warnings.
+1. Decide whether the request is a single-stock task or an explicit multi-stock, portfolio, industry, or theme task. Do not infer basket constituents.
+2. For a single stock, read [references/data_contract.md](references/data_contract.md) before changing fields, market routing, or output sheets. For prediction requests, also read [references/forecasting.md](references/forecasting.md).
+3. For multiple stocks or repeatable tasks, read [references/batch_contract.md](references/batch_contract.md). For source consistency, retries, logs, scheduling state, or versions, read [references/operations.md](references/operations.md).
+4. Use online mode for current Chinese-market research when AKShare and network access are available. Use online US mode only when the Twelve Data key, SEC User-Agent, and required network access are available.
+5. Run `scripts/marketsignal.py` for one stock or `scripts/market_batch.py` for a manifest. Add forecasting only in online mode and use enough history.
+6. For Chinese markets, inspect source and cache status. Request price cross-validation when the user needs source consistency evidence; unsupported markets must be reported explicitly.
+7. For forecasting, use only records returned and cleaned by the current single-stock run. Reject fixture rows, enforce point-in-time availability, and keep future external features fixed at the last real data cutoff.
+8. Treat missing, invalid, duplicated, out-of-range, unsupported, source-failed, mismatched, or insufficient-history records as quality signals. Keep completed batch items when another item fails.
+9. Deliver all workbook paths and summarize per-item status, attempts, source validation, market, currency, data cutoff, row counts, selected model, validation metrics, forecast interval, limitations, and quality warnings.
 
 ## Commands
 
@@ -59,6 +64,13 @@ Run a real-data Chinese A-share forecast:
 
 ```bash
 .venv/bin/python scripts/marketsignal.py --symbol 600519 --market cn_a --start-date 2024-01-01 --end-date YYYY-MM-DD --mode online --forecast --forecast-horizon 5 --output outputs/maotai_forecast.xlsx
+```
+
+Run a versioned multi-stock or industry task:
+
+```bash
+.venv/bin/python scripts/market_batch.py --manifest examples/china_liquor.yaml --dry-run
+.venv/bin/python scripts/market_batch.py --manifest examples/china_liquor.yaml --force
 ```
 
 Run a Hong Kong stock report:
@@ -94,6 +106,9 @@ Run the validation suite:
 - Include source, market, currency, data range, row counts, limitations, and quality checks in the workbook.
 - Include entity mapping, financial-reporting period, filing or notice date, accession number when available, calculation method, and source location where applicable.
 - For forecasts, include data cutoff, training and validation ranges, baseline comparison, model version, validation method, error metrics, interval method, backtest details, and feature coefficients.
+- For multi-stock tasks, require an explicit versioned manifest and retain every normalized constituent, attempt count, output path, and isolated failure.
+- When cross-validation is requested, compare aligned closes without replacing the primary series; report unsupported adapters or mismatches.
+- Include the central component versions in every workbook and keep output schemas compatible with the declared contract version.
 - Never run a formal forecast from fixture mode or fixture rows. Fail clearly when clean online price history is below the configured minimum.
 - Prevent look-ahead by using only prices through the feature date and only financial, news, and notice records available on or before that date.
 - Preserve business dates such as trading dates, publication times, report periods, filing dates, and requested analysis ranges.

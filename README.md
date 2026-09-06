@@ -1,8 +1,8 @@
 # MarketSignal Intelligence
 
-MarketSignal Intelligence 是一个面向中国股票市场和美国股票市场的 Agent Skill。它可以针对单只股票采集行情、财务、公告与相关新闻，完成清洗、去重、范围处理、中文或英文关键词舆情分类、指标计算、数据质量检查，并生成可追溯的 Excel 报告。
+MarketSignal Intelligence 是一个面向中国股票市场和美国股票市场的 Agent Skill。它可以针对单只或多只明确指定的股票采集行情、财务、公告与相关新闻，完成清洗、去重、范围处理、中文或英文关键词舆情分类、指标计算、数据质量检查、预测、横向比较和可追溯 Excel 交付。
 
-当前仓库已完成阶段三：在阶段二支持中国 A 股、B 股、港股和美股真实数据采集的基础上，增加了基准模型、可解释模型、时间序列回测、误差评估、预测区间和 Excel 预测报告。多股票比较和定期任务仍在后续计划中。
+当前仓库已完成阶段四：在阶段三真实数据预测基础上，增加了多股票、用户定义行业或主题篮子、可重复任务清单、失败重试与隔离、结构化日志、行情多源交叉校验和统一组件版本管理。
 
 ## 当前能力
 
@@ -22,6 +22,11 @@ MarketSignal Intelligence 是一个面向中国股票市场和美国股票市场
 - 使用上一收盘价基准模型和多信号岭回归模型进行比较，按走步回测 RMSE 自动选择模型。
 - 输出 MAE、RMSE、MAPE、收益率 MAE、方向准确率、逐日预测与实际值对比、90% 经验预测区间和特征贡献。
 - 对预测特征执行时间可用性约束，禁止使用目标日之后的价格、财务申报、新闻和公告。
+- 使用版本化 YAML/JSON 清单运行多股票、投资组合、行业篮子或主题篮子任务，成分股必须由用户明确提供。
+- 对批量任务逐股重试并隔离失败，已完成主体不会因其他主体失败而丢失。
+- 输出 JSONL 结构化日志，并通过状态文件支持由外部调度器重复调用及间隔控制。
+- 对中国 A 股和港股提供可选的第二行情源收盘价交叉校验，不一致时保留主数据并给出警告。
+- 对 Skill、数据契约、批量契约、数据源适配器、预测引擎、模型和 Excel 模板进行集中版本管理。
 - 保留数据源和处理状态；Excel 不写入文档创建、更新或生成日期元数据。
 
 ## 支持的市场代码
@@ -141,6 +146,44 @@ export MARKETSIGNAL_SEC_USER_AGENT="MarketSignal Intelligence contact@example.co
 
 岭回归使用的特征包括短期收益、移动平均偏离、历史波动率、成交量变化、近七日新闻数量与情绪、近三十日公告数量、净利率、流动比率、经营现金流率和收入变化。财务数据只有在 `filed_date` 不晚于特征日时才允许进入模型。
 
+## 阶段四多主体任务
+
+批量任务使用版本化清单。`portfolio`、`industry` 和 `theme` 都要求明确列出股票，不自动猜测行业或主题成分。
+
+仓库提供贵州茅台与五粮液的白酒行业示例：
+
+```bash
+.venv/bin/python scripts/market_batch.py \
+  --manifest examples/china_liquor.yaml \
+  --dry-run
+
+.venv/bin/python scripts/market_batch.py \
+  --manifest examples/china_liquor.yaml \
+  --force
+```
+
+`--dry-run` 只验证清单和主体代码。正常运行会为每只股票生成详细工作簿，并生成：
+
+```text
+outputs/china_liquor_batch.xlsx
+```
+
+清单中的 `execution.attempts` 控制逐股重试，`continue_on_error` 控制某只股票失败后是否继续。配置 `schedule.interval_hours` 后，命令可由外部调度器重复调用；未到执行间隔时返回 `skipped`，`--force` 可以绕过间隔检查。运行日志和调度状态默认保存在 `.cache`，不会提交凭据。
+
+单股命令也可以请求行情交叉校验：
+
+```bash
+.venv/bin/python scripts/marketsignal.py \
+  --symbol 600519 \
+  --market cn_a \
+  --mode online \
+  --cross-validate-prices \
+  --cross-validation-tolerance-pct 1.0 \
+  --output outputs/maotai_market_signal.xlsx
+```
+
+交叉校验按交易日对齐两个来源的收盘价，报告重叠行数、平均和最大差异、超过容差的行数。校验结果不会覆盖或平均主行情数据。批量横向比较还会汇总区间收益率、收益波动率、净利率、流动比率、经营现金流率和新闻情绪数量。
+
 参数说明：
 
 | 参数 | 说明 |
@@ -161,6 +204,8 @@ export MARKETSIGNAL_SEC_USER_AGENT="MarketSignal Intelligence contact@example.co
 | `--forecast-minimum-history` | 可选，预测所需最少清洗后行情行数，最低可设为 80，默认 120。 |
 | `--forecast-validation-points` | 可选，扩展窗口回测的验证行数，默认 40。 |
 | `--forecast-ridge-alpha` | 可选，岭回归正则化强度，必须大于 0，默认 1.0。 |
+| `--cross-validate-prices` | 可选，对支持的市场请求第二行情源收盘价校验。 |
+| `--cross-validation-tolerance-pct` | 可选，交叉校验允许的收盘价差异百分比，默认 1.0。 |
 
 在线模式在缺少必要凭据、网络请求失败、接口返回异常或没有有效数据时会返回错误，不会将失败伪装为成功结果。
 
@@ -181,8 +226,12 @@ export MARKETSIGNAL_SEC_USER_AGENT="MarketSignal Intelligence contact@example.co
 | `模型评估` | MAE、RMSE、MAPE、收益率 MAE、方向准确率、训练与验证范围、防泄漏规则和模型选择。仅预测运行生成。 |
 | `回测明细` | 扩展窗口逐日预测、实际收盘价、误差、方向判断和当次训练样本数。仅预测运行生成。 |
 | `特征贡献` | 岭回归标准化系数、影响方向、当前特征值和特征解释。仅预测运行生成。 |
+| `交叉校验` | 主副行情源、重叠记录数、价格差异、允许容差和校验状态。仅请求交叉校验时生成。 |
 | `数据来源` | 数据提供方、运行模式、缓存状态、来源地址、原始行数、清洗行数、输出行数、市场、币种和说明。 |
 | `数据质量` | 原始记录数、清洗后记录数、输出记录数、重复记录数、无效记录数、范围外记录数和总体状态。 |
+| `版本信息` | Skill、数据契约、批量契约、数据源、预测引擎、模型和 Excel 模板版本。 |
+
+批量汇总工作簿包含 `README`、`主体任务`、`横向比较` 和 `版本信息`。`横向比较` 使用统一字段展示行情表现、财务比率、新闻情绪、数据覆盖和预测结果；每只股票的完整明细仍保留在独立工作簿中。
 
 交易日、新闻发布时间、报告期、公告日期和请求范围属于业务数据，会保留在分析结果中；文档和文件名不添加创建、更新或生成日期标签。
 
@@ -194,10 +243,17 @@ export MARKETSIGNAL_SEC_USER_AGENT="MarketSignal Intelligence contact@example.co
 ├── agents/openai.yaml          # Skill 界面元数据
 ├── scripts/marketsignal.py     # 多市场采集、清洗、指标计算和 Excel 导出
 ├── scripts/forecasting.py      # 特征构造、走步回测、模型训练和未来预测
+├── scripts/market_batch.py     # 多主体清单、重试、隔离、调度状态和汇总导出
+├── scripts/operations.py       # 结构化日志、重试、间隔判断和行情交叉校验
+├── scripts/versioning.py       # 组件版本注册表
 ├── scripts/run_sample.py       # 固定样例入口
+├── scripts/run_acceptance.py   # 确定性端到端验收入口
+├── examples/                   # 多股票、行业或主题任务清单示例
 ├── fixtures/                   # 美股行情、新闻、主体、财务和申报测试数据
 ├── references/data_contract.md # 输入、输出、数据字段和错误约定
 ├── references/forecasting.md   # 阶段三模型、特征、防泄漏和评估规则
+├── references/batch_contract.md # 阶段四批量任务清单契约
+├── references/operations.md    # 交叉校验、重试、日志、调度和版本规则
 ├── tests/                      # 自动化测试
 ├── outputs/                    # 示例 Excel 输出
 ├── 工作目标.md                  # 项目目标
@@ -210,9 +266,10 @@ export MARKETSIGNAL_SEC_USER_AGENT="MarketSignal Intelligence contact@example.co
 
 ```bash
 .venv/bin/python -m unittest discover -s tests -v
+.venv/bin/python scripts/run_acceptance.py
 ```
 
-测试覆盖阶段一与阶段二回归、四类市场代码解析、中文数据归一化、财务指标提取、预测真实来源约束、财务可用时间、防数据泄漏、两个预测模型、回测指标、预测区间和阶段三 Excel 工作表。阶段实施方式与实际验证记录见 [工作计划.md](工作计划.md)。
+31 项测试覆盖早期阶段回归、四类市场、数据治理、真实数据预测、时间可用性、多主体清单、重试恢复、失败隔离、调度间隔、行情交叉校验、版本注册和 Excel 契约。`run_acceptance.py` 使用固定样例执行完整批量入口、单股报告和汇总报告验收。阶段实施方式与实际验证记录见 [工作计划.md](工作计划.md)。
 
 ## 使用边界
 
@@ -224,5 +281,7 @@ export MARKETSIGNAL_SEC_USER_AGENT="MarketSignal Intelligence contact@example.co
 - 预测使用历史关系估计未来，不代表因果关系；突发事件、停牌、涨跌停、制度变化和数据源变化都可能使模型失效。
 - 未来交易日目前按周一至周五估算，不包含交易所节假日日历；预测区间是基于回测误差的经验区间，不是收益保证。
 - 多步预测采用递归价格路径，未来新闻、公告和财务输入固定在数据截止点，因此预测步数越远，不确定性越高。
-- 当前版本不包含多股票比较或定期任务。
+- 行业和主题任务不会自动发现成分股，需要用户提供明确列表；当前横向比较不执行自动选股或组合优化。
+- 仓库提供可重复调用和间隔判断，不运行常驻调度服务；实际触发频率由外部调度器负责。
+- 行情交叉校验当前支持中国 A 股和港股；中国 B 股与美股会明确返回未配置第二适配器。
 - 输出用于研究辅助，不构成投资建议，也不保证任何收益或价格变动。

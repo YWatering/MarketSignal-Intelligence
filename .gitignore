@@ -2,7 +2,9 @@ __pycache__/
 *.py[cod]
 .venv/
 .cache/
+logs/
 .pytest_cache/
 outputs/*.xlsx
 !outputs/aapl_market_signal.xlsx
 !outputs/maotai_forecast.xlsx
+!outputs/china_liquor_batch.xlsx

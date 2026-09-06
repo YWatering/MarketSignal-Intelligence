@@ -138,7 +138,7 @@ class MarketSignalTests(unittest.TestCase):
             self.assertEqual(1, summary["price_quality"]["invalid_rows"])
             workbook = load_workbook(output, data_only=True)
             self.assertEqual(
-                ["README", "主体信息", "行情数据", "财务数据", "新闻舆情", "公告数据", "指标分析", "数据来源", "数据质量"],
+                ["README", "主体信息", "行情数据", "财务数据", "新闻舆情", "公告数据", "指标分析", "数据来源", "数据质量", "版本信息"],
                 workbook.sheetnames,
             )
             self.assertEqual("field", workbook["README"]["A1"].value)
@@ -516,6 +516,7 @@ class MarketSignalTests(unittest.TestCase):
                     "特征贡献",
                     "数据来源",
                     "数据质量",
+                    "版本信息",
                 ],
                 workbook.sheetnames,
             )

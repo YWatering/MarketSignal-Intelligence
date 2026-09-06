@@ -1,4 +1,4 @@
-# Stage-Three Data Contract
+# Stage-Four Data Contract
 
 ## Request
 
@@ -21,6 +21,8 @@ The command-line interface accepts:
 | `forecast_minimum_history` | forecast | Minimum clean online price rows. Default: 120; cannot be lower than 80. |
 | `forecast_validation_points` | forecast | Requested walk-forward validation rows. Default: 40; minimum: 10. |
 | `forecast_ridge_alpha` | forecast | Positive ridge regularization strength. Default: 1.0. |
+| `cross_validate_prices` | no | Compare primary close prices with a configured secondary adapter. |
+| `cross_validation_tolerance_pct` | cross-validation | Positive allowed close difference percentage. Default: 1.0. |
 
 The implementation handles one symbol per run. Market is inferred from common formats when possible:
 
@@ -32,7 +34,7 @@ The implementation handles one symbol per run. Market is inferred from common fo
 | `00700` or `00700.HK` | `00700.HK` | `hk` | HKD |
 | `AAPL` or `NASDAQ:AAPL` | `AAPL` | `us` | USD |
 
-Conflicting market and exchange suffixes fail early. Formal forecasts require real online data; fixture mode remains available only for deterministic collection and workbook regression tests.
+Conflicting market and exchange suffixes fail early. Formal forecasts require real online data; fixture mode remains available only for deterministic collection and workbook regression tests. Multi-stock, industry, and theme requests use the versioned manifest described in [batch_contract.md](batch_contract.md).
 
 ## Normalized Price Record
 
@@ -204,8 +206,10 @@ The generated workbook contains these sheets:
 | `模型评估` | Walk-forward ranges, MAE, RMSE, MAPE, return MAE, direction accuracy, interval error, regularization, and leakage controls. Present only for forecast runs. |
 | `回测明细` | One-step predictions and actual closes for every validation target and both models. Present only for forecast runs. |
 | `特征贡献` | Standardized ridge coefficients, rank, direction, current feature value, and non-causal feature description. Present only for forecast runs. |
+| `交叉校验` | Primary and secondary price providers, overlap, close differences, configured tolerance, and status. Present only when requested. |
 | `数据来源` | Provider, market, currency, mode, cache status, source location, raw, clean, and output row counts, and notes. |
 | `数据质量` | Raw counts, cleaned counts, output counts, duplicate counts, invalid counts, out-of-range counts, and status. |
+| `版本信息` | Skill, contracts, source adapters, forecast engine, model, and workbook template versions. |
 
 Every source-dependent sheet must retain source information. The workbook must not include document creation, update, or generation date labels.
 
@@ -218,3 +222,5 @@ Every source-dependent sheet must retain source information. The workbook must n
 - Fixture mode remains available for offline validation and reproducible US AAPL examples.
 - Forecast requests fail when mode is not online, fixture records are present, history is insufficient, parameters are invalid, or model fitting produces non-finite values.
 - Forecast intervals and feature coefficients are reported as model diagnostics, not guarantees or causal effects.
+- A secondary-source mismatch changes the pipeline status to `warning` but does not silently replace or average the primary price series.
+- Multi-item failures are isolated by the batch runner and recorded as `partial` results when at least one other item succeeds.

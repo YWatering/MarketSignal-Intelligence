@@ -1,7 +1,7 @@
 interface:
   display_name: "MarketSignal Intelligence"
-  short_description: "Analyze and forecast China or US stocks from real data to Excel"
-  default_prompt: "Use $market-signal-intelligence to collect real online single-stock prices, financial data, notices, and news, then run leakage-aware backtesting and export a traceable Excel report with forecasts and uncertainty."
+  short_description: "Research and compare stocks with real data and forecasts"
+  default_prompt: "Use $market-signal-intelligence to research or compare specified China or US stocks from real data, validate sources, run explainable forecasts when requested, and export traceable Excel reports."
 
 policy:
   allow_implicit_invocation: true

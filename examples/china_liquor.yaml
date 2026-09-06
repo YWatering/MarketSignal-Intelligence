@@ -1,0 +1,28 @@
+version: "1.0"
+name: china-liquor-comparison
+task_type: industry
+group: 白酒
+mode: online
+start_date: 2024-01-01
+end_date: latest
+forecast: true
+forecast_horizon: 5
+cross_validate_prices: true
+cross_validation_tolerance_pct: 1.0
+output_dir: outputs/china_liquor
+summary_output: outputs/china_liquor_batch.xlsx
+log_file: .cache/marketsignal/china_liquor.jsonl
+state_file: .cache/marketsignal/china_liquor-state.json
+execution:
+  attempts: 2
+  retry_delay_seconds: 1
+  continue_on_error: true
+schedule:
+  interval_hours: 24
+items:
+  - symbol: "600519"
+    market: cn_a
+    label: 贵州茅台
+  - symbol: "000858"
+    market: cn_a
+    label: 五粮液
