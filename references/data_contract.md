@@ -1,4 +1,4 @@
-# Stage-Two Data Contract
+# Stage-Three Data Contract
 
 ## Request
 
@@ -16,6 +16,11 @@ The command-line interface accepts:
 | `sec_user_agent` | US online | Application name plus contact email, or `MARKETSIGNAL_SEC_USER_AGENT`. |
 | `cache_dir` | no | Local response cache directory. |
 | `refresh_cache` | no | Ignore existing cached responses for this run. |
+| `forecast` | no | Run stage-three forecasting. Requires `mode=online`. |
+| `forecast_horizon` | forecast | Future trading steps from 1 to 20. Default: 5. |
+| `forecast_minimum_history` | forecast | Minimum clean online price rows. Default: 120; cannot be lower than 80. |
+| `forecast_validation_points` | forecast | Requested walk-forward validation rows. Default: 40; minimum: 10. |
+| `forecast_ridge_alpha` | forecast | Positive ridge regularization strength. Default: 1.0. |
 
 The implementation handles one symbol per run. Market is inferred from common formats when possible:
 
@@ -27,7 +32,7 @@ The implementation handles one symbol per run. Market is inferred from common fo
 | `00700` or `00700.HK` | `00700.HK` | `hk` | HKD |
 | `AAPL` or `NASDAQ:AAPL` | `AAPL` | `us` | USD |
 
-Conflicting market and exchange suffixes fail early. The pipeline does not provide price forecasts or advanced sentiment analysis.
+Conflicting market and exchange suffixes fail early. Formal forecasts require real online data; fixture mode remains available only for deterministic collection and workbook regression tests.
 
 ## Normalized Price Record
 
@@ -131,6 +136,57 @@ Announcement rows include filing or notice date, report date when available, for
 - China A rows use `公告` as the normalized form; B rows use the same adapter when usable rows are returned and otherwise report the limitation explicitly.
 - Hong Kong notice collection is not configured in this stage; the source record explicitly reports that limitation.
 
+## Forecast Contract
+
+Stage three consumes the cleaned records created by the same stage-two run. It does not read a separate manually prepared prediction dataset.
+
+Required prediction inputs:
+
+- At least the configured number of clean online price rows.
+- Price rows whose source is not a fixture.
+- Any available financial, news, and announcement rows from the same run; fixture rows in any prediction dataset cause failure.
+- A valid market and currency inherited from the normalized instrument.
+
+Two models are always evaluated:
+
+- `last_close_baseline` / `persistence-v1`: predicts the next close as the previous close.
+- `multisignal_ridge` / `ridge-v1`: predicts the next-period return from standardized technical, financial, news, and announcement features with ridge regularization.
+
+Validation uses expanding-window one-step-ahead walk-forward evaluation. Each validation target is predicted from a model trained only on earlier samples. The selected model is the model with lower validation RMSE, using MAE as a tie-breaker. A simpler baseline may therefore be selected when the more complex model does not improve out-of-sample error.
+
+The forecast result record contains:
+
+```json
+{
+  "model_name": "last_close_baseline",
+  "model_version": "persistence-v1",
+  "selected": true,
+  "forecast_step": 1,
+  "estimated_trading_date": "YYYY-MM-DD",
+  "data_cutoff": "YYYY-MM-DD",
+  "previous_close": 0.0,
+  "predicted_return": 0.0,
+  "predicted_close": 0.0,
+  "lower_bound": 0.0,
+  "upper_bound": 0.0,
+  "interval_level": 90,
+  "interval_method": "walk-forward absolute-error quantile scaled by square root of horizon",
+  "input_status": "actual stage-two data",
+  "market": "cn_a",
+  "currency": "CNY"
+}
+```
+
+Future dates skip weekends but do not apply exchange holiday calendars. Multi-step model predictions are recursive: predicted prices feed later technical features, while financial, news, and announcement information remains fixed at the last real data cutoff.
+
+Point-in-time controls:
+
+- Price features end at the feature date.
+- Financial rows require `filed_date <= feature_date`.
+- News publication time and announcement filing date must not exceed the feature date.
+- Feature scaling and model fitting are recalculated from earlier training samples in each validation fold.
+- No future external information is invented for multi-step forecasts.
+
 ## Workbook Contract
 
 The generated workbook contains these sheets:
@@ -144,6 +200,10 @@ The generated workbook contains these sheets:
 | `新闻舆情` | Cleaned news records, links, Chinese or English rule-based tone, and evidence. |
 | `公告数据` | Cleaned China notices or US SEC filing history. |
 | `指标分析` | Derived market, financial, news, and notice indicators with methods. |
+| `预测结果` | Baseline and ridge future forecasts, selected-model flag, point estimates, uncertainty bounds, data cutoff, and input status. Present only for forecast runs. |
+| `模型评估` | Walk-forward ranges, MAE, RMSE, MAPE, return MAE, direction accuracy, interval error, regularization, and leakage controls. Present only for forecast runs. |
+| `回测明细` | One-step predictions and actual closes for every validation target and both models. Present only for forecast runs. |
+| `特征贡献` | Standardized ridge coefficients, rank, direction, current feature value, and non-causal feature description. Present only for forecast runs. |
 | `数据来源` | Provider, market, currency, mode, cache status, source location, raw, clean, and output row counts, and notes. |
 | `数据质量` | Raw counts, cleaned counts, output counts, duplicate counts, invalid counts, out-of-range counts, and status. |
 
@@ -156,3 +216,5 @@ Every source-dependent sheet must retain source information. The workbook must n
 - US online mode fails before a network request when required Twelve Data credentials or SEC User-Agent contact information is missing.
 - A failed source is reported as an error; an unsupported dataset, such as Hong Kong notices in this stage, is reported explicitly in the source record.
 - Fixture mode remains available for offline validation and reproducible US AAPL examples.
+- Forecast requests fail when mode is not online, fixture records are present, history is insufficient, parameters are invalid, or model fitting produces non-finite values.
+- Forecast intervals and feature coefficients are reported as model diagnostics, not guarantees or causal effects.

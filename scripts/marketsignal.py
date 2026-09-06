@@ -31,6 +31,8 @@ from openpyxl import Workbook
 from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 
+from forecasting import ForecastError, run_forecast_analysis
+
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 FIXTURES_DIR = PROJECT_ROOT / "fixtures"
@@ -1733,6 +1735,7 @@ def build_workbook(
     qualities: dict[str, dict[str, int]],
     source_records: list[dict[str, Any]],
     pipeline_status: str,
+    forecast_result: dict[str, Any] | None = None,
 ) -> None:
     workbook = Workbook()
     workbook.remove(workbook.active)
@@ -1756,9 +1759,20 @@ def build_workbook(
         ["news_rows", len(news), "Rows after cleaning and range filtering"],
         ["announcement_rows", len(announcements), "Rows after cleaning and range filtering"],
         ["indicator_rows", len(indicators), "Derived market, financial, news, and filing indicators"],
-        ["forecast_status", "not implemented in stage two", "Forecasting is planned for a later stage"],
+        ["forecast_status", forecast_result["status"] if forecast_result else "not requested", "Forecasting requires online stage-two data"],
         ["limitations", "Rule-based news tone is not investment advice", "Financial coverage varies by market adapter"],
     ]
+    if forecast_result:
+        readme_rows.extend(
+            [
+                ["forecast_data_cutoff", forecast_result["data_cutoff"], "Last real stage-two trading observation used by the model"],
+                ["forecast_horizon", forecast_result["forecast_horizon"], "Estimated future trading steps"],
+                ["selected_model", forecast_result["selected_model"], forecast_result["selected_model_version"]],
+                ["training_price_rows", forecast_result["training_price_rows"], "Clean online price rows used for feature construction"],
+                ["validation_samples", forecast_result["validation_samples"], "Expanding-window one-step-ahead validation rows"],
+                ["forecast_limitations", forecast_result["limitations"], "Research estimate; not investment advice"],
+            ]
+        )
     readme = workbook.create_sheet("README")
     _write_table(readme, ["field", "value", "notes"], readme_rows)
 
@@ -1810,6 +1824,119 @@ def build_workbook(
     )
     _set_number_format(indicator_sheet, {"value"}, "0.0000")
 
+    if forecast_result:
+        forecast_sheet = workbook.create_sheet("预测结果")
+        forecast_headers = [
+            "model_name",
+            "model_version",
+            "selected",
+            "forecast_step",
+            "estimated_trading_date",
+            "data_cutoff",
+            "previous_close",
+            "predicted_return",
+            "predicted_close",
+            "lower_bound",
+            "upper_bound",
+            "interval_level",
+            "interval_method",
+            "input_status",
+            "market",
+            "currency",
+        ]
+        _write_table(
+            forecast_sheet,
+            forecast_headers,
+            [[row[key] for key in forecast_headers] for row in forecast_result["forecasts"]],
+        )
+        _set_number_format(
+            forecast_sheet,
+            {"previous_close", "predicted_close", "lower_bound", "upper_bound"},
+            "0.0000",
+        )
+        _set_number_format(forecast_sheet, {"predicted_return"}, "0.0000%")
+
+        evaluation_sheet = workbook.create_sheet("模型评估")
+        evaluation_headers = [
+            "model_name",
+            "model_version",
+            "selected",
+            "validation_method",
+            "validation_rows",
+            "training_start",
+            "training_end",
+            "validation_start",
+            "validation_end",
+            "mae",
+            "rmse",
+            "mape",
+            "return_mae",
+            "direction_accuracy",
+            "interval_absolute_error",
+            "ridge_alpha",
+            "leakage_controls",
+        ]
+        _write_table(
+            evaluation_sheet,
+            evaluation_headers,
+            [[row[key] for key in evaluation_headers] for row in forecast_result["evaluations"]],
+        )
+        _set_number_format(
+            evaluation_sheet,
+            {"mae", "rmse", "mape", "return_mae", "direction_accuracy", "interval_absolute_error"},
+            "0.0000",
+        )
+
+        backtest_sheet = workbook.create_sheet("回测明细")
+        backtest_headers = [
+            "model_name",
+            "model_version",
+            "feature_date",
+            "target_date",
+            "previous_close",
+            "predicted_return",
+            "actual_return",
+            "predicted_close",
+            "actual_close",
+            "error",
+            "absolute_error",
+            "direction_correct",
+            "training_samples",
+        ]
+        _write_table(
+            backtest_sheet,
+            backtest_headers,
+            [[row[key] for key in backtest_headers] for row in forecast_result["backtest"]],
+        )
+        _set_number_format(
+            backtest_sheet,
+            {"previous_close", "predicted_close", "actual_close", "error", "absolute_error"},
+            "0.0000",
+        )
+        _set_number_format(backtest_sheet, {"predicted_return", "actual_return"}, "0.0000%")
+
+        contribution_sheet = workbook.create_sheet("特征贡献")
+        contribution_headers = [
+            "model_name",
+            "model_version",
+            "rank",
+            "feature",
+            "coefficient_pct_return_per_std",
+            "direction",
+            "latest_feature_value",
+            "description",
+        ]
+        _write_table(
+            contribution_sheet,
+            contribution_headers,
+            [[row[key] for key in contribution_headers] for row in forecast_result["feature_contributions"]],
+        )
+        _set_number_format(
+            contribution_sheet,
+            {"coefficient_pct_return_per_std", "latest_feature_value"},
+            "0.0000",
+        )
+
     source_sheet = workbook.create_sheet("数据来源")
     _write_table(
         source_sheet,
@@ -1823,6 +1950,15 @@ def build_workbook(
         quality = qualities[dataset]
         for metric in ("raw_rows", "clean_rows", "output_rows", "duplicates_removed", "invalid_rows", "out_of_range"):
             quality_rows.append([dataset, metric, quality[metric], "processing quality metric"])
+    if forecast_result:
+        quality_rows.extend(
+            [
+                ["forecast", "training_price_rows", forecast_result["training_price_rows"], "clean online stage-two price rows"],
+                ["forecast", "training_samples", forecast_result["training_samples"], "leakage-controlled supervised samples"],
+                ["forecast", "validation_samples", forecast_result["validation_samples"], "walk-forward validation samples"],
+                ["forecast", "status", forecast_result["status"], "forecast pipeline status"],
+            ]
+        )
     quality_rows.append(["pipeline", "status", pipeline_status, "warning means one or more required datasets have no clean rows"])
     quality_sheet = workbook.create_sheet("数据质量")
     _write_table(quality_sheet, ["dataset", "metric", "value", "notes"], quality_rows)
@@ -1850,9 +1986,16 @@ def run_pipeline(
     cache_dir: Path = DEFAULT_CACHE_DIR,
     refresh_cache: bool = False,
     announcement_limit: int = 40,
+    forecast: bool = False,
+    forecast_horizon: int = 5,
+    forecast_minimum_history: int = 120,
+    forecast_validation_points: int = 40,
+    forecast_ridge_alpha: float = 1.0,
     timeout: int = 20,
 ) -> dict[str, Any]:
     _validate_request(symbol, start_date, end_date, mode, output, announcement_limit)
+    if forecast and mode != "online":
+        raise PipelineError("forecasting requires online mode and real stage-two source data")
     instrument = parse_symbol(symbol, market)
     normalized_symbol = instrument["symbol"]
     source_records: list[dict[str, Any]] = []
@@ -2012,6 +2155,24 @@ def run_pipeline(
     news_quality["output_rows"] = len(news)
     announcement_quality["output_rows"] = len(announcements)
 
+    forecast_result: dict[str, Any] | None = None
+    if forecast:
+        try:
+            forecast_result = run_forecast_analysis(
+                prices,
+                financials,
+                news,
+                announcements,
+                horizon=forecast_horizon,
+                minimum_history=forecast_minimum_history,
+                validation_points=forecast_validation_points,
+                ridge_alpha=forecast_ridge_alpha,
+                market=instrument["market"],
+                currency=instrument["currency"],
+            )
+        except ForecastError as exc:
+            raise PipelineError(str(exc)) from exc
+
     source_records.extend(
         [
             _source_record("prices", price_provider, mode, price_location, price_cache, price_quality, "daily OHLCV data", instrument["market"], instrument["currency"]),
@@ -2021,6 +2182,23 @@ def run_pipeline(
             _source_record("announcements", announcement_provider, mode, announcement_location, announcement_cache, announcement_quality, "market filing and notice history", instrument["market"], instrument["currency"]),
         ]
     )
+    if forecast_result:
+        source_records.append(
+            {
+                "dataset": "forecast",
+                "provider": "MarketSignal forecasting engine",
+                "mode": "derived from online stage-two data",
+                "status": forecast_result["status"],
+                "cache_status": "not_applicable",
+                "source_location": "workbook stage-two datasets",
+                "raw_rows": forecast_result["training_price_rows"],
+                "clean_rows": forecast_result["training_samples"],
+                "output_rows": len(forecast_result["forecasts"]),
+                "notes": f"selected {forecast_result['selected_model']} using walk-forward RMSE",
+                "market": instrument["market"],
+                "currency": instrument["currency"],
+            }
+        )
 
     required_sets = {"prices": prices, "financials": financials, "news": news}
     pipeline_status = "pass" if all(required_sets.values()) else "warning"
@@ -2046,6 +2224,7 @@ def run_pipeline(
         qualities,
         source_records,
         pipeline_status,
+        forecast_result,
     )
     return {
         "symbol": normalized_symbol,
@@ -2060,6 +2239,11 @@ def run_pipeline(
         "news_rows": len(news),
         "announcement_rows": len(announcements),
         "indicator_rows": len(indicators),
+        "forecast_status": forecast_result["status"] if forecast_result else "not_requested",
+        "forecast_rows": len(forecast_result["forecasts"]) if forecast_result else 0,
+        "selected_model": forecast_result["selected_model"] if forecast_result else "",
+        "forecast_data_cutoff": forecast_result["data_cutoff"] if forecast_result else "",
+        "forecast_validation_samples": forecast_result["validation_samples"] if forecast_result else 0,
         "qualities": qualities,
         # Keep stage-one summary keys available to existing callers.
         "price_quality": price_quality,
@@ -2086,6 +2270,11 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--cache-dir", type=Path, default=DEFAULT_CACHE_DIR)
     parser.add_argument("--refresh-cache", action="store_true")
     parser.add_argument("--announcement-limit", type=int, default=40)
+    parser.add_argument("--forecast", action="store_true", help="run stage-three forecasting from real online stage-two data")
+    parser.add_argument("--forecast-horizon", type=int, default=5, help="future trading steps, from 1 to 20")
+    parser.add_argument("--forecast-minimum-history", type=int, default=120, help="minimum clean price rows required")
+    parser.add_argument("--forecast-validation-points", type=int, default=40, help="walk-forward validation rows")
+    parser.add_argument("--forecast-ridge-alpha", type=float, default=1.0, help="positive ridge regularization strength")
     parser.add_argument("--timeout", type=int, default=20)
     return parser
 
@@ -2111,6 +2300,11 @@ def main(argv: list[str] | None = None) -> int:
             cache_dir=args.cache_dir,
             refresh_cache=args.refresh_cache,
             announcement_limit=args.announcement_limit,
+            forecast=args.forecast,
+            forecast_horizon=args.forecast_horizon,
+            forecast_minimum_history=args.forecast_minimum_history,
+            forecast_validation_points=args.forecast_validation_points,
+            forecast_ridge_alpha=args.forecast_ridge_alpha,
             timeout=args.timeout,
         )
     except PipelineError as exc:

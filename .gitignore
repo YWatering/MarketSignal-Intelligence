@@ -5,3 +5,4 @@ __pycache__/
 .pytest_cache/
 outputs/*.xlsx
 !outputs/aapl_market_signal.xlsx
+!outputs/maotai_forecast.xlsx

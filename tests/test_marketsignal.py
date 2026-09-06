@@ -6,6 +6,7 @@ import sys
 import tempfile
 import unittest
 import zipfile
+from datetime import datetime, timedelta
 from unittest.mock import patch
 from pathlib import Path
 
@@ -31,6 +32,69 @@ from marketsignal import (
     parse_symbol,
     run_pipeline,
 )
+from forecasting import ForecastError, build_feature_vector, run_forecast_analysis
+
+
+def _forecast_prices(count: int = 180, source: str = "AKShare online test") -> list[dict[str, object]]:
+    start = datetime(2025, 1, 2)
+    rows: list[dict[str, object]] = []
+    close = 100.0
+    for index in range(count):
+        date = start + timedelta(days=index)
+        close *= 1.0 + 0.001 + (0.004 if index % 9 == 0 else -0.002 if index % 13 == 0 else 0.0)
+        rows.append(
+            {
+                "date": date.strftime("%Y-%m-%d"),
+                "open": close * 0.998,
+                "high": close * 1.006,
+                "low": close * 0.994,
+                "close": close,
+                "volume": 1_000_000 + index * 1_000,
+                "source": source,
+                "market": "cn_a",
+                "currency": "CNY",
+            }
+        )
+    return rows
+
+
+def _forecast_financials() -> list[dict[str, object]]:
+    rows: list[dict[str, object]] = []
+    for period_end, filed_date, revenue, income, assets, liabilities, cash_flow in (
+        ("2024-12-31", "2025-03-20", 1000, 200, 2000, 800, 260),
+        ("2025-06-30", "2025-08-20", 600, 130, 2200, 850, 170),
+    ):
+        period_start = period_end[:4] + "-01-01"
+        values = {
+            "revenue": revenue,
+            "net_income": income,
+            "assets": assets,
+            "liabilities": liabilities,
+            "current_assets": assets * 0.5,
+            "current_liabilities": liabilities * 0.5,
+            "cash_and_equivalents": assets * 0.2,
+            "operating_cash_flow": cash_flow,
+        }
+        for metric, value in values.items():
+            rows.append(
+                {
+                    "period_start": period_start,
+                    "period_end": period_end,
+                    "filed_date": filed_date,
+                    "fiscal_year": period_end[:4],
+                    "fiscal_period": "报告期",
+                    "form": "报告期",
+                    "metric": metric,
+                    "metric_label": metric,
+                    "value": value,
+                    "unit": "CNY",
+                    "accession_number": "",
+                    "source": "AKShare online test",
+                    "market": "cn_a",
+                    "currency": "CNY",
+                }
+            )
+    return rows
 
 
 class MarketSignalTests(unittest.TestCase):
@@ -111,6 +175,18 @@ class MarketSignalTests(unittest.TestCase):
             self.assertEqual(2, summary["news_rows"])
             self.assertEqual(2, summary["price_quality"]["out_of_range"])
             self.assertEqual(0, summary["news_quality"]["out_of_range"])
+
+    def test_fixture_data_cannot_run_formal_forecast(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            with self.assertRaisesRegex(PipelineError, "requires online mode"):
+                run_pipeline(
+                    symbol="AAPL",
+                    start_date="2026-08-03",
+                    end_date="2026-08-14",
+                    mode="fixture",
+                    output=Path(temporary_directory) / "report.xlsx",
+                    forecast=True,
+                )
 
     def test_invalid_range_fails_before_pipeline_execution(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -284,6 +360,169 @@ class MarketSignalTests(unittest.TestCase):
         self.assertEqual(1, len(cleaned))
         self.assertEqual("年度", cleaned[0]["form"])
         self.assertEqual(0, quality["invalid_rows"])
+
+    def test_forecast_features_respect_financial_filing_date(self) -> None:
+        prices = _forecast_prices(90)
+        financials = _forecast_financials()
+        before_filing = build_feature_vector(
+            [row for row in prices if str(row["date"]) <= "2025-03-10"],
+            financials,
+            [],
+            [],
+        )
+        after_filing = build_feature_vector(
+            [row for row in prices if str(row["date"]) <= "2025-04-10"],
+            financials,
+            [],
+            [],
+        )
+        self.assertEqual(0.0, before_filing["fundamental_coverage"])
+        self.assertGreater(after_filing["fundamental_coverage"], 0.0)
+        self.assertAlmostEqual(0.2, after_filing["net_profit_margin"])
+
+    def test_forecast_analysis_produces_models_backtest_and_intervals(self) -> None:
+        prices = _forecast_prices()
+        result = run_forecast_analysis(
+            prices,
+            _forecast_financials(),
+            [
+                {
+                    "published_at": "2025-05-20 09:00:00",
+                    "sentiment": "positive",
+                    "source": "AKShare online test",
+                }
+            ],
+            [
+                {
+                    "filed_date": "2025-05-21",
+                    "source": "AKShare online test",
+                }
+            ],
+            horizon=3,
+            minimum_history=120,
+            validation_points=20,
+            ridge_alpha=1.0,
+            market="cn_a",
+            currency="CNY",
+        )
+        self.assertEqual("pass", result["status"])
+        self.assertEqual(6, len(result["forecasts"]))
+        self.assertEqual(2, len(result["evaluations"]))
+        self.assertEqual(40, len(result["backtest"]))
+        self.assertEqual(14, len(result["feature_contributions"]))
+        self.assertIn(result["selected_model"], {"last_close_baseline", "multisignal_ridge"})
+        self.assertTrue(all(row["lower_bound"] <= row["predicted_close"] <= row["upper_bound"] for row in result["forecasts"]))
+
+    def test_forecast_analysis_rejects_fixture_price_sources(self) -> None:
+        with self.assertRaisesRegex(ForecastError, "cannot use fixture"):
+            run_forecast_analysis(
+                _forecast_prices(source="fixture:prices"),
+                [],
+                [],
+                [],
+                minimum_history=120,
+                market="cn_a",
+                currency="CNY",
+            )
+
+    def test_forecast_analysis_rejects_insufficient_history(self) -> None:
+        with self.assertRaisesRegex(ForecastError, "requires at least 120"):
+            run_forecast_analysis(
+                _forecast_prices(count=100),
+                _forecast_financials(),
+                [],
+                [],
+                minimum_history=120,
+                market="cn_a",
+                currency="CNY",
+            )
+
+    def test_forecast_analysis_honors_requested_validation_window(self) -> None:
+        result = run_forecast_analysis(
+            _forecast_prices(count=100),
+            _forecast_financials(),
+            [],
+            [],
+            minimum_history=80,
+            validation_points=30,
+            market="cn_a",
+            currency="CNY",
+        )
+        self.assertEqual(30, result["validation_samples"])
+        self.assertEqual(60, len(result["backtest"]))
+
+    def test_online_pipeline_writes_stage_three_workbook(self) -> None:
+        prices = _forecast_prices()
+        entity = {
+            "symbol": "600519.SH",
+            "provider_symbol": "600519",
+            "market": "cn_a",
+            "market_name": "中国A股",
+            "company_name": "贵州茅台",
+            "cik": "",
+            "exchange": "SSE",
+            "sic": "",
+            "sic_description": "",
+            "currency": "CNY",
+            "source": "AKShare",
+        }
+        with tempfile.TemporaryDirectory() as temporary_directory, patch(
+            "marketsignal.fetch_online_china_prices",
+            return_value=(prices, "https://example.test/prices", "miss", "AKShare online test"),
+        ), patch(
+            "marketsignal.fetch_online_china_news",
+            return_value=([], "https://example.test/news", "miss", "AKShare online test"),
+        ), patch(
+            "marketsignal.fetch_online_china_financials",
+            return_value=(
+                _forecast_financials(),
+                entity,
+                "https://example.test/financials",
+                "miss",
+                "AKShare online test",
+                "test financials",
+            ),
+        ), patch(
+            "marketsignal.fetch_online_china_announcements",
+            return_value=([], "https://example.test/notices", "not_supported", "test notice adapter"),
+        ):
+            output = Path(temporary_directory) / "forecast.xlsx"
+            summary = run_pipeline(
+                symbol="600519",
+                start_date=None,
+                end_date=None,
+                mode="online",
+                output=output,
+                forecast=True,
+                forecast_horizon=3,
+                forecast_minimum_history=120,
+                forecast_validation_points=20,
+            )
+            self.assertEqual("pass", summary["forecast_status"])
+            self.assertEqual(6, summary["forecast_rows"])
+            workbook = load_workbook(output, data_only=True)
+            self.assertEqual(
+                [
+                    "README",
+                    "主体信息",
+                    "行情数据",
+                    "财务数据",
+                    "新闻舆情",
+                    "公告数据",
+                    "指标分析",
+                    "预测结果",
+                    "模型评估",
+                    "回测明细",
+                    "特征贡献",
+                    "数据来源",
+                    "数据质量",
+                ],
+                workbook.sheetnames,
+            )
+            self.assertGreater(workbook["预测结果"].max_row, 1)
+            self.assertEqual(3, workbook["模型评估"].max_row)
+            self.assertGreater(workbook["回测明细"].max_row, 1)
+            self.assertEqual(15, workbook["特征贡献"].max_row)
 
     def test_sec_user_agent_and_url_redaction(self) -> None:
         self.assertEqual(
