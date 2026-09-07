@@ -4,6 +4,19 @@ MarketSignal Intelligence 是一个面向中国股票市场和美国股票市场
 
 当前仓库已完成阶段八：在阶段五单股价格预测、阶段六多股票超额收益面板和阶段七单股超额收益模式基础上，新增面向 A 股、B 股、港股和美股的市场隔离超额收益机器学习预测能力。
 
+一句话概括：这是一个“真实数据采集 + 可解释数据处理 + 严格时间验证 + Excel 研究交付”的股票研究 Agent Skill。它不会自动猜测股票池、替换基准或把预测结果包装成确定性结论。
+
+## 文档导航
+
+- [当前能力](#当前能力)
+- [支持的市场代码](#支持的市场代码)
+- [环境要求](#环境要求)
+- [单股采集](#中国市场在线采集)
+- [预测模式总览](#预测模式总览)
+- [批量任务](#阶段四多主体任务)
+- [Excel 输出](#excel-输出)
+- [验证与限制](#验证)
+
 ## 当前能力
 
 - 识别 A 股、B 股、港股和美股代码，并统一输出标准代码、数据源代码、市场和交易币种。
@@ -64,6 +77,18 @@ MarketSignal Intelligence 是一个面向中国股票市场和美国股票市场
 - 美股在线模式需要可访问 Twelve Data、Yahoo Finance RSS 和 SEC EDGAR。
 - 美股行情需要 Twelve Data API Key。
 - 美股 SEC 采集需要包含联系邮箱的 User-Agent。
+
+## 如何选择入口
+
+| 你的目标 | 使用入口 | 结果 |
+| --- | --- | --- |
+| 只想采集一只股票的行情、财务、新闻和公告 | `scripts/marketsignal.py` | 单股研究 Excel |
+| 想比较多只股票、行业或主题 | `scripts/market_batch.py` | 每只股票的明细 Excel + 汇总 Excel |
+| 想预测一只股票的绝对价格 | `scripts/marketsignal.py --forecast` | 阶段五价格预测 Excel |
+| 想比较多只股票相对基准的超额收益 | `scripts/market_ml.py` + `panel` 清单 | 阶段六机器学习面板 Excel |
+| 想预测单只股票相对基准的超额收益 | `scripts/market_ml.py` + `single_asset` 清单 | 阶段七或阶段八单股超额收益 Excel |
+
+正式预测应使用 `online` 模式和真实数据。`fixture` 模式只用于固定样例、回归测试和开发验证。
 
 ## 安装
 
@@ -133,6 +158,19 @@ export MARKETSIGNAL_SEC_USER_AGENT="MarketSignal Intelligence contact@example.co
   --mode online \
   --output outputs/aapl_market_signal.xlsx
 ```
+
+## 预测模式总览
+
+不同预测模式回答不同研究问题，不能互相替代：
+
+| 阶段 | 入口 | 预测目标 | 市场范围 | 主要输出 |
+| --- | --- | --- | --- | --- |
+| 阶段五 | `marketsignal.py --forecast` | 单股未来绝对价格、收益率和方向 | 由单股数据路由决定 | `预测结果`、`模型评估`、`回测明细` |
+| 阶段六 | `market_ml.py` + `panel` 清单 | 多股票相对显式基准的超额收益 | A 股兼容清单 | `机器学习预测`、`分组检验`、`模型排行榜` |
+| 阶段七 | `market_ml.py` + `single_asset` 清单 | 单只 A 股相对基准的超额收益 | A 股兼容清单 | `单股超额收益预测`、`成本敏感性` |
+| 阶段八 | `market_ml.py` + 版本 `2.0` 清单 | 同市场单股或面板超额收益 | A 股、B 股、港股、美股 | 市场审计字段和 `市场适配检查` |
+
+阶段五的预测目标是价格；阶段六至阶段八的预测目标是超额收益。后者衡量的是股票相对指定基准的表现，不等价于预测其绝对股价。
 
 ## 阶段五真实数据预测与模型选择
 
@@ -256,6 +294,8 @@ export MARKETSIGNAL_SEC_USER_AGENT="MarketSignal Intelligence contact@example.co
 
 阶段八继续使用六类候选模型、嵌套时序验证、独立最终测试、模型准入、单股相对基准成本敏感性和点时财务/新闻/公告特征。B 股和港股使用 `qfq`，美股使用 `adjusted_all`；若缺少调整价格、同币种基准或必需凭据，任务会明确失败，不会使用未调整价格或猜测数据替代。
 
+仓库已包含并验证 B 股、港股的真实在线结果：`outputs/china_b_single_excess_return.xlsx` 与 `outputs/hk_single_excess_return.xlsx`。美股示例清单和确定性验证已具备；执行真实美股任务前必须配置 Twelve Data API Key 与 SEC User-Agent。
+
 ## 阶段四多主体任务
 
 批量任务使用版本化清单。`portfolio`、`industry` 和 `theme` 都要求明确列出股票，不自动猜测行业或主题成分。
@@ -352,7 +392,7 @@ outputs/china_liquor_batch.xlsx
 | `数据质量` | 原始记录数、清洗后记录数、输出记录数、重复记录数、无效记录数、范围外记录数和总体状态。 |
 | `版本信息` | Skill、数据契约、批量契约、数据源、预测引擎、模型和 Excel 模板版本。 |
 
-阶段六工作簿独立包含以下工作表：
+阶段六至阶段八机器学习工作簿包含以下工作表：
 
 | 工作表 | 内容 |
 | --- | --- |
@@ -402,6 +442,17 @@ outputs/china_liquor_batch.xlsx
 ├── 工作目标.md                  # 项目目标
 └── 工作计划.md                  # 分阶段计划与完成记录
 ```
+
+## 相关文档
+
+- [SKILL.md](SKILL.md)：Agent Skill 的使用范围、执行规则和输出要求；
+- [工作目标.md](工作目标.md)：项目总体目标和功能边界；
+- [工作计划.md](工作计划.md)：阶段一至阶段八的实施方式与验证记录；
+- [references/data_contract.md](references/data_contract.md)：单股与多市场输入、输出和错误契约；
+- [references/forecasting.md](references/forecasting.md)：阶段五价格预测规则；
+- [references/ml_forecasting.md](references/ml_forecasting.md)：阶段六至阶段八的超额收益模型与验证规则；
+- [references/batch_contract.md](references/batch_contract.md)：批量任务清单与汇总输出契约；
+- [references/operations.md](references/operations.md)：缓存、日志、重试、间隔控制和版本规则。
 
 ## 验证
 
