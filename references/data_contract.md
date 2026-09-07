@@ -1,4 +1,4 @@
-# Stage-Five Data Contract
+# Stage-Six Data Contract
 
 ## Request
 
@@ -227,6 +227,37 @@ The generated workbook contains these sheets:
 | `版本信息` | Skill, contracts, source adapters, forecast engine, model, and workbook template versions. |
 
 Every source-dependent sheet must retain source information. The workbook must not include document creation, update, or generation date labels.
+
+## Machine-Learning Panel Contract
+
+Stage six adds a separate version `1.0` YAML manifest consumed by `scripts/market_ml.py`. It does not change the stage-five batch manifest.
+
+Required top-level fields:
+
+| Field | Requirement |
+| --- | --- |
+| `version` | Must equal `1.0`. |
+| `name` | Non-empty task name. |
+| `market` | Must be `cn_a` in the first implementation. |
+| `mode` | Must be `online` for formal output. |
+| `start_date`, `end_date` | Business-data range; `end_date` may be `latest`. |
+| `benchmark.symbol` | Explicit six-digit index code; no automatic substitution. |
+| `horizons` | One or more trading-step targets from 1 to 20. |
+| `membership_policy` | `user_supplied_fixed_universe` or `historical_constituents`. |
+| `items` | At least two explicit A-share stocks with optional label, industry, size, and membership fields. |
+| `output` | `.xlsx` workbook path. |
+
+Validation settings include `final_test_dates`, `outer_test_dates`, `outer_folds`, `inner_validation_dates`, `minimum_training_dates`, `transaction_cost_bps`, and `slippage_bps`.
+
+The normalized panel key is:
+
+```text
+symbol + feature_date + target_date + horizon
+```
+
+Each row records adjusted stock return, benchmark return, excess return, outperform label, benchmark identity, membership metadata, adjustment method, and a feature mapping. Stock labels must use `qfq` prices. The final test is stored separately and is never used to alter the feature set, parameter grid, or outer-window candidate.
+
+See [ml_forecasting.md](ml_forecasting.md) for feature, model, validation, promotion, explanation, and workbook rules.
 
 ## Error Behavior
 

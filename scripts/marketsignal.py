@@ -528,7 +528,7 @@ def _normalize_dataframe_price_rows(
                 "high": _number_value(_pick_value(record, ("high", "最高", "最高价"))),
                 "low": _number_value(_pick_value(record, ("low", "最低", "最低价"))),
                 "close": _number_value(_pick_value(record, ("close", "收盘", "收盘价"))),
-                "volume": _number_value(_pick_value(record, ("volume", "成交量"))),
+                "volume": _number_value(_pick_value(record, ("volume", "成交量", "amount"))),
                 "source": source,
                 "market": market,
                 "currency": currency,
@@ -1022,11 +1022,138 @@ def fetch_online_china_prices(
         instrument, start_date, end_date, cache_dir, refresh_cache
     )
     return (
-        _normalize_dataframe_price_rows(frame, f"AKShare {function_name}", instrument["market"], instrument["currency"]),
+        _normalize_dataframe_price_rows(
+            frame,
+            f"AKShare {function_name}",
+            instrument["market"],
+            instrument["currency"],
+        ),
         AKSHARE_DOC_URL,
         cache_status,
         f"AKShare {function_name}",
     )
+
+
+def fetch_online_china_adjusted_prices(
+    instrument: dict[str, str],
+    start_date: str | None,
+    end_date: str | None,
+    cache_dir: Path | None,
+    refresh_cache: bool,
+) -> tuple[list[dict[str, Any]], str, str, str]:
+    """Fetch forward-adjusted A-share history for return modeling."""
+    if instrument["market"] != "cn_a":
+        raise PipelineError("stage-six adjusted-price collection currently supports China A shares only")
+    ak = _akshare_module()
+    start = _date_argument(start_date, "1970-01-01")
+    end = _date_argument(end_date, "2050-01-01")
+    candidates = [
+        (
+            "stock_zh_a_hist",
+            lambda: ak.stock_zh_a_hist(
+                symbol=instrument["code"],
+                period="daily",
+                start_date=start,
+                end_date=end,
+                adjust="qfq",
+                timeout=20,
+            ),
+        ),
+        (
+            "stock_zh_a_hist_tx",
+            lambda: ak.stock_zh_a_hist_tx(
+                symbol=f"{instrument['exchange_prefix'].lower()}{instrument['code']}",
+                start_date=start,
+                end_date=end,
+                adjust="qfq",
+            ),
+        ),
+    ]
+    errors: list[str] = []
+    for function_name, loader in candidates:
+        try:
+            frame, cache_status = _fetch_akshare_table(
+                function_name,
+                f"adjusted-price:{instrument['provider_symbol']}:{start}:{end}:{function_name}:qfq",
+                loader,
+                cache_dir,
+                refresh_cache,
+            )
+            if len(frame.index) == 0:
+                errors.append(f"AKShare {function_name} returned no rows")
+                continue
+            provider = f"AKShare {function_name} qfq"
+            rows = _normalize_dataframe_price_rows(
+                frame, provider, instrument["market"], instrument["currency"]
+            )
+            for row in rows:
+                row["adjustment"] = "qfq"
+            return rows, AKSHARE_DOC_URL, cache_status, provider
+        except PipelineError as exc:
+            errors.append(str(exc))
+    raise PipelineError("; ".join(errors) or "adjusted A-share price adapters returned no usable rows")
+
+
+def fetch_online_china_index_prices(
+    symbol: str,
+    start_date: str | None,
+    end_date: str | None,
+    cache_dir: Path | None,
+    refresh_cache: bool,
+) -> tuple[list[dict[str, Any]], str, str, str]:
+    """Fetch an explicit China A-share index used as the excess-return benchmark."""
+    code = str(symbol).strip().upper().replace(".SH", "").replace(".SZ", "")
+    if not re.fullmatch(r"\d{6}", code):
+        raise PipelineError("benchmark index symbol must contain six digits")
+    ak = _akshare_module()
+    start = _date_argument(start_date, "1970-01-01")
+    end = _date_argument(end_date, "2050-01-01")
+    exchange_symbol = f"sz{code}" if code.startswith("399") else f"sh{code}"
+    eastmoney_symbol = f"csi{code}" if code.startswith("000") else exchange_symbol
+    candidates = [
+        (
+            "index_zh_a_hist",
+            lambda: ak.index_zh_a_hist(
+                symbol=code,
+                period="daily",
+                start_date=start,
+                end_date=end,
+            ),
+        ),
+        (
+            "stock_zh_index_daily_em",
+            lambda: ak.stock_zh_index_daily_em(symbol=eastmoney_symbol),
+        ),
+        (
+            "stock_zh_index_daily_tx",
+            lambda: ak.stock_zh_index_daily_tx(symbol=exchange_symbol),
+        ),
+        (
+            "stock_zh_index_daily",
+            lambda: ak.stock_zh_index_daily(symbol=exchange_symbol),
+        ),
+    ]
+    errors: list[str] = []
+    for function_name, loader in candidates:
+        try:
+            frame, cache_status = _fetch_akshare_table(
+                function_name,
+                f"index-price:{code}:{start}:{end}:{function_name}",
+                loader,
+                cache_dir,
+                refresh_cache,
+            )
+            if len(frame.index) == 0:
+                errors.append(f"AKShare {function_name} returned no rows")
+                continue
+            provider = f"AKShare {function_name}"
+            rows = _normalize_dataframe_price_rows(frame, provider, "cn_a", "CNY")
+            for row in rows:
+                row["adjustment"] = "index_level"
+            return rows, AKSHARE_DOC_URL, cache_status, provider
+        except PipelineError as exc:
+            errors.append(str(exc))
+    raise PipelineError("; ".join(errors) or f"AKShare has no index adapter for {code}")
 
 
 def fetch_online_china_secondary_prices(

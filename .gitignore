@@ -8,3 +8,4 @@ outputs/*.xlsx
 !outputs/aapl_market_signal.xlsx
 !outputs/maotai_forecast.xlsx
 !outputs/china_liquor_batch.xlsx
+!outputs/china_a_ml_panel.xlsx

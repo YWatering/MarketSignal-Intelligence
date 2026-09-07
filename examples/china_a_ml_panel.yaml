@@ -1,0 +1,46 @@
+version: "1.0"
+name: china-a-excess-return-panel
+market: cn_a
+mode: online
+start_date: 2023-01-01
+end_date: latest
+horizons: [1, 5]
+membership_policy: user_supplied_fixed_universe
+include_context: true
+benchmark:
+  symbol: "000300"
+  label: 沪深300
+  type: market_index
+final_test_dates: 40
+outer_test_dates: 20
+outer_folds: 3
+inner_validation_dates: 20
+minimum_training_dates: 120
+transaction_cost_bps: 10
+slippage_bps: 5
+output: outputs/china_a_ml_panel.xlsx
+items:
+  - symbol: "600519"
+    label: 贵州茅台
+    industry: 食品饮料
+    size_bucket: 大市值
+  - symbol: "600036"
+    label: 招商银行
+    industry: 银行
+    size_bucket: 大市值
+  - symbol: "000333"
+    label: 美的集团
+    industry: 家用电器
+    size_bucket: 大市值
+  - symbol: "300750"
+    label: 宁德时代
+    industry: 电力设备
+    size_bucket: 大市值
+  - symbol: "600276"
+    label: 恒瑞医药
+    industry: 医药生物
+    size_bucket: 中大市值
+  - symbol: "002415"
+    label: 海康威视
+    industry: 计算机
+    size_bucket: 中大市值
