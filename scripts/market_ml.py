@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Run stage-six panel or stage-seven single-asset excess-return workflows."""
+"""Run stage-six to stage-eight benchmark-relative excess-return workflows."""
 
 from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from datetime import date
 from pathlib import Path
@@ -14,7 +15,12 @@ import yaml
 from openpyxl import Workbook
 
 from marketsignal import (
+    SEC_COMPANYFACTS_URL,
+    SEC_SUBMISSIONS_URL,
+    SEC_TICKERS_URL,
     PipelineError,
+    _fetch_json,
+    _sec_headers,
     _remove_core_properties,
     _set_number_format,
     _write_table,
@@ -27,20 +33,55 @@ from marketsignal import (
     fetch_online_china_financials,
     fetch_online_china_index_prices,
     fetch_online_china_news,
+    fetch_online_news,
+    fetch_online_us_adjusted_prices,
     filter_announcements_by_range,
     filter_financials_by_range,
     filter_news_by_range,
     filter_prices_by_range,
     parse_symbol,
+    resolve_entity,
+    extract_announcement_rows,
+    extract_financial_rows,
+    _ticker_records,
 )
 from ml_forecasting import MLForecastError, build_excess_return_panel, run_ml_forecast_analysis
-from versioning import ML_PANEL_CONTRACT_VERSION, SINGLE_ASSET_CONTRACT_VERSION, component_versions
+from versioning import (
+    ML_PANEL_CONTRACT_VERSION,
+    MULTI_MARKET_ML_CONTRACT_VERSION,
+    SINGLE_ASSET_CONTRACT_VERSION,
+    component_versions,
+)
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_CACHE_DIR = PROJECT_ROOT / ".cache" / "marketsignal"
 ALLOWED_MEMBERSHIP_POLICIES = {"user_supplied_fixed_universe", "historical_constituents"}
 ALLOWED_TASK_TYPES = {"panel", "single_asset"}
+ALLOWED_BENCHMARK_TYPES = {"market_index", "benchmark_asset"}
+SUPPORTED_MARKETS = {"cn_a", "cn_b", "hk", "us"}
+MARKET_ALIASES = {
+    "a": "cn_a",
+    "a股": "cn_a",
+    "b": "cn_b",
+    "b股": "cn_b",
+    "hk": "hk",
+    "港股": "hk",
+    "us": "us",
+    "美股": "us",
+}
+MARKET_CALENDARS = {
+    "cn_a": "CN_A_SHARE",
+    "cn_b": "CN_B_SHARE",
+    "hk": "HKEX",
+    "us": "NYSE_NASDAQ",
+}
+MARKET_TIMEZONES = {
+    "cn_a": "Asia/Shanghai",
+    "cn_b": "Asia/Shanghai",
+    "hk": "Asia/Hong_Kong",
+    "us": "America/New_York",
+}
 
 
 class MLTaskError(RuntimeError):
@@ -87,11 +128,29 @@ def _non_negative_float(value: Any, field: str) -> float:
     return number
 
 
+def _market_value(value: Any) -> str:
+    normalized = str(value or "").strip().lower()
+    market = MARKET_ALIASES.get(normalized, normalized)
+    if market not in SUPPORTED_MARKETS:
+        raise MLTaskError(f"market must be one of: {', '.join(sorted(SUPPORTED_MARKETS))}")
+    return market
+
+
 def validate_manifest(payload: dict[str, Any]) -> dict[str, Any]:
+    market = _market_value(payload.get("market", "cn_a"))
     version = str(payload.get("version", ""))
-    if version not in {ML_PANEL_CONTRACT_VERSION, SINGLE_ASSET_CONTRACT_VERSION}:
+    allowed_versions = {
+        ML_PANEL_CONTRACT_VERSION,
+        SINGLE_ASSET_CONTRACT_VERSION,
+        MULTI_MARKET_ML_CONTRACT_VERSION,
+    }
+    if version not in allowed_versions:
         raise MLTaskError(
-            f"ML manifest version must be {ML_PANEL_CONTRACT_VERSION}; received {payload.get('version', 'missing')}"
+            f"ML manifest version must be one of {', '.join(sorted(allowed_versions))}; received {payload.get('version', 'missing')}"
+        )
+    if market != "cn_a" and version != MULTI_MARKET_ML_CONTRACT_VERSION:
+        raise MLTaskError(
+            f"market={market} requires ML manifest version {MULTI_MARKET_ML_CONTRACT_VERSION}"
         )
     name = str(payload.get("name", "")).strip()
     if not name:
@@ -99,10 +158,8 @@ def validate_manifest(payload: dict[str, Any]) -> dict[str, Any]:
     task_type = str(payload.get("task_type", "panel")).strip() or "panel"
     if task_type not in ALLOWED_TASK_TYPES:
         raise MLTaskError(f"task_type must be one of: {', '.join(sorted(ALLOWED_TASK_TYPES))}")
-    if str(payload.get("market", "cn_a")) != "cn_a":
-        raise MLTaskError("stage-six/stage-seven online collection currently supports market=cn_a only")
     if str(payload.get("mode", "online")) != "online":
-        raise MLTaskError("formal stage-six/stage-seven forecasts require mode=online")
+        raise MLTaskError("formal stage-six to stage-eight forecasts require mode=online")
     start_date = _date_value(payload.get("start_date"), "start_date")
     end_date = _date_value(payload.get("end_date", "latest"), "end_date")
     if start_date > end_date:
@@ -110,9 +167,27 @@ def validate_manifest(payload: dict[str, Any]) -> dict[str, Any]:
     benchmark = payload.get("benchmark")
     if not isinstance(benchmark, dict) or not str(benchmark.get("symbol", "")).strip():
         raise MLTaskError("ML manifest requires an explicit benchmark.symbol")
+    benchmark_market = _market_value(benchmark.get("market", market))
+    if benchmark_market != market:
+        raise MLTaskError("benchmark.market must match the task market; cross-market panels are not supported")
+    benchmark_type = str(benchmark.get("type", "market_index")).strip() or "market_index"
+    if benchmark_type not in ALLOWED_BENCHMARK_TYPES:
+        raise MLTaskError(
+            f"benchmark.type must be one of: {', '.join(sorted(ALLOWED_BENCHMARK_TYPES))}"
+        )
     benchmark_symbol = str(benchmark["symbol"]).strip()
-    if not benchmark_symbol.isdigit() or len(benchmark_symbol) != 6:
-        raise MLTaskError("benchmark.symbol must contain six digits")
+    benchmark_instrument: dict[str, str] | None = None
+    if market == "cn_a" and benchmark_type == "market_index":
+        if not benchmark_symbol.isdigit() or len(benchmark_symbol) != 6:
+            raise MLTaskError("cn_a market_index benchmark.symbol must contain six digits")
+        benchmark_currency = "CNY"
+    else:
+        try:
+            benchmark_instrument = parse_symbol(benchmark_symbol, benchmark_market)
+        except PipelineError as exc:
+            raise MLTaskError(f"benchmark: {exc}") from exc
+        benchmark_symbol = benchmark_instrument["symbol"]
+        benchmark_currency = benchmark_instrument["currency"]
     horizon_values = payload.get("horizons", [1, 5])
     if not isinstance(horizon_values, list) or not horizon_values:
         raise MLTaskError("horizons must be a non-empty list")
@@ -139,7 +214,7 @@ def validate_manifest(payload: dict[str, Any]) -> dict[str, Any]:
     else:
         items = payload.get("items")
         if not isinstance(items, list) or len(items) < 2:
-            raise MLTaskError("ML manifest requires at least two explicitly supplied A-share items")
+            raise MLTaskError("ML manifest requires at least two explicitly supplied same-market items")
         if len(items) > 30:
             raise MLTaskError("ML manifest supports at most 30 items per run")
     normalized_items: list[dict[str, Any]] = []
@@ -148,7 +223,7 @@ def validate_manifest(payload: dict[str, Any]) -> dict[str, Any]:
         if not isinstance(item, dict):
             raise MLTaskError(f"item {index} must be a mapping")
         try:
-            instrument = parse_symbol(str(item.get("symbol", "")), "cn_a")
+            instrument = parse_symbol(str(item.get("symbol", "")), market)
         except PipelineError as exc:
             raise MLTaskError(f"item {index}: {exc}") from exc
         if instrument["symbol"] in seen:
@@ -158,6 +233,8 @@ def validate_manifest(payload: dict[str, Any]) -> dict[str, Any]:
             {
                 "instrument": instrument,
                 "symbol": instrument["symbol"],
+                "market": instrument["market"],
+                "currency": instrument["currency"],
                 "label": str(item.get("label", instrument["symbol"])).strip() or instrument["symbol"],
                 "industry": str(item.get("industry", "未分类")).strip() or "未分类",
                 "size_bucket": str(item.get("size_bucket", "未分类")).strip() or "未分类",
@@ -166,7 +243,14 @@ def validate_manifest(payload: dict[str, Any]) -> dict[str, Any]:
                 "membership_source": str(item.get("membership_source", membership_policy)),
             }
         )
-    default_output = "outputs/maotai_single_excess_return.xlsx" if task_type == "single_asset" else "outputs/china_ml_panel.xlsx"
+    if task_type == "panel" and len({item["currency"] for item in normalized_items}) > 1:
+        raise MLTaskError("panel items must use one common trading currency")
+    if normalized_items and normalized_items[0]["currency"] != benchmark_currency:
+        raise MLTaskError(
+            "benchmark currency must match the stock currency; cross-currency excess returns require an explicit FX layer"
+        )
+    default_stem = f"{market}_single_excess_return" if task_type == "single_asset" else f"{market}_ml_panel"
+    default_output = f"outputs/{default_stem}.xlsx"
     output = Path(str(payload.get("output", default_output)))
     if output.suffix.lower() != ".xlsx":
         raise MLTaskError("output must use the .xlsx extension")
@@ -174,14 +258,19 @@ def validate_manifest(payload: dict[str, Any]) -> dict[str, Any]:
         "version": version,
         "name": name,
         "task_type": task_type,
-        "market": "cn_a",
+        "market": market,
+        "calendar": MARKET_CALENDARS[market],
+        "timezone": MARKET_TIMEZONES[market],
         "mode": "online",
         "start_date": start_date,
         "end_date": end_date,
         "benchmark": {
             "symbol": benchmark_symbol,
             "label": str(benchmark.get("label", benchmark_symbol)),
-            "type": str(benchmark.get("type", "market_index")),
+            "type": benchmark_type,
+            "market": benchmark_market,
+            "currency": benchmark_currency,
+            "instrument": benchmark_instrument,
         },
         "horizons": horizons,
         "membership_policy": membership_policy,
@@ -243,6 +332,8 @@ def _collect_context(
             source_rows.append(
                 {
                     "symbol": instrument["symbol"],
+                    "market": instrument["market"],
+                    "currency": instrument["currency"],
                     "dataset": dataset,
                     "provider": provider,
                     "status": "pass" if cleaned else "warning",
@@ -258,6 +349,8 @@ def _collect_context(
             source_rows.append(
                 {
                     "symbol": instrument["symbol"],
+                    "market": instrument["market"],
+                    "currency": instrument["currency"],
                     "dataset": dataset,
                     "provider": "AKShare",
                     "status": "warning",
@@ -270,6 +363,172 @@ def _collect_context(
                 }
             )
     return datasets["financials"], datasets["news"], datasets["announcements"], source_rows
+
+
+def _collect_us_context(
+    instrument: dict[str, str],
+    start_date: str,
+    end_date: str,
+    cache_dir: Path,
+    refresh_cache: bool,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+    """Collect SEC and Yahoo context while preserving filing availability dates."""
+    sec_user_agent = os.environ.get("MARKETSIGNAL_SEC_USER_AGENT", "")
+    headers = _sec_headers(sec_user_agent)
+    timeout = 30
+    source_rows: list[dict[str, Any]] = []
+    datasets: dict[str, list[dict[str, Any]]] = {"financials": [], "news": [], "announcements": []}
+
+    def record_source(
+        dataset: str,
+        provider: str,
+        location: str,
+        cache_status: str,
+        raw_count: int,
+        clean_count: int,
+        output_count: int,
+        notes: str,
+    ) -> None:
+        source_rows.append(
+            {
+                "symbol": instrument["symbol"],
+                "market": instrument["market"],
+                "currency": instrument["currency"],
+                "dataset": dataset,
+                "provider": provider,
+                "status": "pass" if output_count else "warning",
+                "cache_status": cache_status,
+                "source_location": location,
+                "raw_rows": raw_count,
+                "clean_rows": clean_count,
+                "output_rows": output_count,
+                "notes": notes,
+            }
+        )
+
+    try:
+        raw_news, location, cache_status = fetch_online_news(
+            instrument["provider_symbol"],
+            timeout,
+            cache_dir,
+            refresh_cache,
+            market=instrument["market"],
+            currency=instrument["currency"],
+        )
+        cleaned, quality = clean_news(raw_news)
+        cleaned, out_of_range = filter_news_by_range(cleaned, start_date, end_date)
+        datasets["news"] = cleaned
+        record_source(
+            "news",
+            "Yahoo Finance RSS",
+            location,
+            cache_status,
+            quality["raw_rows"],
+            quality["clean_rows"],
+            len(cleaned),
+            f"out_of_range={out_of_range}",
+        )
+    except PipelineError as exc:
+        record_source("news", "Yahoo Finance RSS", "Yahoo Finance RSS", "error", 0, 0, 0, str(exc))
+
+    try:
+        ticker_payload, ticker_cache = _fetch_json(
+            SEC_TICKERS_URL,
+            timeout,
+            headers=headers,
+            cache_dir=cache_dir,
+            refresh_cache=refresh_cache,
+            is_sec_request=True,
+        )
+        ticker_match = next(
+            (
+                record
+                for record in _ticker_records(ticker_payload)
+                if str(record.get("ticker", "")).upper() == instrument["provider_symbol"].upper()
+            ),
+            None,
+        )
+        if not ticker_match:
+            raise PipelineError(f"SEC ticker mapping did not find symbol: {instrument['symbol']}")
+        cik = str(ticker_match.get("cik_str", ticker_match.get("cik", ""))).zfill(10)
+        submissions_url = f"{SEC_SUBMISSIONS_URL}/CIK{cik}.json"
+        submissions, submissions_cache = _fetch_json(
+            submissions_url,
+            timeout,
+            headers=headers,
+            cache_dir=cache_dir,
+            refresh_cache=refresh_cache,
+            is_sec_request=True,
+        )
+        entity = resolve_entity(
+            instrument["provider_symbol"],
+            ticker_payload,
+            submissions,
+            "SEC EDGAR",
+            instrument=instrument,
+        )
+        facts_url = f"{SEC_COMPANYFACTS_URL}/CIK{entity['cik']}.json"
+        facts, facts_cache = _fetch_json(
+            facts_url,
+            timeout,
+            headers=headers,
+            cache_dir=cache_dir,
+            refresh_cache=refresh_cache,
+            is_sec_request=True,
+        )
+        raw_financials = extract_financial_rows(facts, "SEC Company Facts", instrument=instrument)
+        cleaned_financials, quality = clean_financials(raw_financials)
+        cleaned_financials, out_of_range = filter_financials_by_range(cleaned_financials, start_date, end_date)
+        datasets["financials"] = cleaned_financials
+        record_source(
+            "financials",
+            "SEC Company Facts",
+            facts_url,
+            "hit" if ticker_cache == submissions_cache == facts_cache == "hit" else "miss",
+            quality["raw_rows"],
+            quality["clean_rows"],
+            len(cleaned_financials),
+            f"entity={entity['company_name']}; cik={entity['cik']}; out_of_range={out_of_range}",
+        )
+        raw_announcements = extract_announcement_rows(
+            submissions,
+            entity["cik"],
+            "SEC EDGAR submissions",
+            limit=40,
+            instrument=instrument,
+        )
+        cleaned_announcements, quality = clean_announcements(raw_announcements)
+        cleaned_announcements, out_of_range = filter_announcements_by_range(
+            cleaned_announcements, start_date, end_date
+        )
+        datasets["announcements"] = cleaned_announcements
+        record_source(
+            "announcements",
+            "SEC EDGAR submissions",
+            submissions_url,
+            submissions_cache,
+            quality["raw_rows"],
+            quality["clean_rows"],
+            len(cleaned_announcements),
+            f"entity={entity['company_name']}; out_of_range={out_of_range}",
+        )
+    except PipelineError as exc:
+        record_source("financials", "SEC EDGAR", SEC_COMPANYFACTS_URL, "error", 0, 0, 0, str(exc))
+        record_source("announcements", "SEC EDGAR", SEC_SUBMISSIONS_URL, "error", 0, 0, 0, str(exc))
+
+    return datasets["financials"], datasets["news"], datasets["announcements"], source_rows
+
+
+def _collect_context_for_market(
+    instrument: dict[str, str],
+    start_date: str,
+    end_date: str,
+    cache_dir: Path,
+    refresh_cache: bool,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+    if instrument["market"] == "us":
+        return _collect_us_context(instrument, start_date, end_date, cache_dir, refresh_cache)
+    return _collect_context(instrument, start_date, end_date, cache_dir, refresh_cache)
 
 
 def _sheet_from_dicts(workbook: Workbook, title: str, rows: list[dict[str, Any]], headers: list[str]) -> Any:
@@ -285,6 +544,16 @@ def build_ml_workbook(
     source_rows: list[dict[str, Any]],
 ) -> None:
     single_asset = config.get("task_type", "panel") == "single_asset"
+    market = config.get("market", result.get("market", "cn_a"))
+    items = config.get("items") or [{}]
+    currency = items[0].get("currency", "CNY")
+    calendar = config.get("calendar", result.get("calendar", "CN_A_SHARE"))
+    timezone = config.get("timezone", "Asia/Shanghai")
+    benchmark = config.get("benchmark", {})
+    benchmark_symbol = benchmark.get("symbol", result.get("benchmark_symbol", ""))
+    benchmark_type = benchmark.get("type", "market_index")
+    benchmark_market = benchmark.get("market", result.get("benchmark_market", market))
+    benchmark_currency = benchmark.get("currency", result.get("benchmark_currency", currency))
     workbook = Workbook()
     workbook.remove(workbook.active)
     workbook.properties.creator = "MarketSignal Intelligence"
@@ -299,9 +568,14 @@ def build_ml_workbook(
             else "Versioned multi-stock panel task",
         ],
         ["task_type", config.get("task_type", "panel"), "single_asset uses one stock relative to the explicit benchmark"],
-        ["market", config["market"], "First implementation supports China A shares"],
-        ["benchmark_symbol", config["benchmark"]["symbol"], config["benchmark"]["label"]],
-        ["benchmark_type", config["benchmark"]["type"], "Explicit benchmark; no automatic substitution"],
+        ["market", market, "Market-isolated task; cross-market panels are disabled"],
+        ["currency", currency, "Local return currency; no implicit FX conversion"],
+        ["calendar", calendar, "Exchange calendar used for estimated target dates"],
+        ["timezone", timezone, "Market-local reporting timezone"],
+        ["benchmark_symbol", benchmark_symbol, benchmark.get("label", benchmark_symbol)],
+        ["benchmark_type", benchmark_type, "Explicit benchmark; no automatic substitution"],
+        ["benchmark_market", benchmark_market, "Must match task market"],
+        ["benchmark_currency", benchmark_currency, "Must match stock currency"],
         ["analysis_start", config["start_date"], "Business data range"],
         ["analysis_end", config["end_date"], "Business data range"],
         ["horizons", ", ".join(map(str, config["horizons"])), "Trading-step excess-return targets"],
@@ -323,10 +597,17 @@ def build_ml_workbook(
         [
             "symbol",
             "label",
+            "market",
+            "currency",
+            "calendar",
+            "timezone",
             "horizon",
             "feature_date",
             "target_date",
             "benchmark_symbol",
+            "benchmark_market",
+            "benchmark_currency",
+            "benchmark_adjustment",
             "stock_return",
             "benchmark_return",
             "excess_return",
@@ -340,10 +621,17 @@ def build_ml_workbook(
             "label",
             "industry",
             "size_bucket",
+            "market",
+            "currency",
+            "calendar",
+            "timezone",
             "horizon",
             "feature_date",
             "target_date",
             "benchmark_symbol",
+            "benchmark_market",
+            "benchmark_currency",
+            "benchmark_adjustment",
             "stock_return",
             "benchmark_return",
             "excess_return",
@@ -373,6 +661,13 @@ def build_ml_workbook(
             "feature_date",
             "estimated_target_date",
             "benchmark_symbol",
+            "market",
+            "currency",
+            "calendar",
+            "timezone",
+            "benchmark_market",
+            "benchmark_currency",
+            "benchmark_adjustment",
             "model_name",
             "model_version",
             "model_status",
@@ -394,6 +689,13 @@ def build_ml_workbook(
             "feature_date",
             "estimated_target_date",
             "benchmark_symbol",
+            "market",
+            "currency",
+            "calendar",
+            "timezone",
+            "benchmark_market",
+            "benchmark_currency",
+            "benchmark_adjustment",
             "model_name",
             "model_version",
             "model_status",
@@ -581,6 +883,13 @@ def build_ml_workbook(
             "fold",
             "split",
             "symbol",
+            "market",
+            "currency",
+            "calendar",
+            "timezone",
+            "benchmark_market",
+            "benchmark_currency",
+            "benchmark_adjustment",
             "feature_date",
             "target_date",
             "horizon",
@@ -600,6 +909,13 @@ def build_ml_workbook(
             "symbol",
             "industry",
             "size_bucket",
+            "market",
+            "currency",
+            "calendar",
+            "timezone",
+            "benchmark_market",
+            "benchmark_currency",
+            "benchmark_adjustment",
             "feature_date",
             "target_date",
             "horizon",
@@ -634,6 +950,10 @@ def build_ml_workbook(
 
     source_headers = [
         "symbol",
+        "market",
+        "currency",
+        "calendar",
+        "timezone",
         "dataset",
         "provider",
         "status",
@@ -642,9 +962,53 @@ def build_ml_workbook(
         "raw_rows",
         "clean_rows",
         "output_rows",
+        "adjustment_method",
         "notes",
     ]
     _sheet_from_dicts(workbook, "数据来源", source_rows, source_headers)
+
+    subject_price_sources = [row for row in source_rows if row.get("dataset") == "adjusted_prices"]
+    benchmark_price_sources = [row for row in source_rows if row.get("dataset") == "benchmark_prices"]
+    context_rows = [row for row in source_rows if row.get("dataset") in {"financials", "news", "announcements"}]
+    adapter_rows = [
+        {
+            "market": market,
+            "currency": currency,
+            "calendar": calendar,
+            "timezone": timezone,
+            "benchmark_symbol": benchmark_symbol,
+            "benchmark_market": benchmark_market,
+            "benchmark_currency": benchmark_currency,
+            "benchmark_adjustment": result.get("benchmark_adjustment", ""),
+            "stock_adjustment": ", ".join(
+                sorted({str(row.get("adjustment_method", "")) for row in subject_price_sources})
+            ),
+            "price_sources": ", ".join(sorted({str(row.get("provider", "")) for row in subject_price_sources})),
+            "context_datasets": len(context_rows),
+            "status": "pass" if subject_price_sources and benchmark_price_sources else "fail",
+            "notes": "same-market, same-currency task; context warnings remain visible in 数据来源",
+        }
+    ]
+    _sheet_from_dicts(
+        workbook,
+        "市场适配检查",
+        adapter_rows,
+        [
+            "market",
+            "currency",
+            "calendar",
+            "timezone",
+            "benchmark_symbol",
+            "benchmark_market",
+            "benchmark_currency",
+            "benchmark_adjustment",
+            "stock_adjustment",
+            "price_sources",
+            "context_datasets",
+            "status",
+            "notes",
+        ],
+    )
 
     version_rows = [
         {"component": component, "version": version, "notes": "central version registry"}
@@ -674,22 +1038,51 @@ def run_ml_task(
     refresh_cache: bool = False,
 ) -> dict[str, Any]:
     config = validate_manifest(_read_manifest(manifest))
-    benchmark_raw, benchmark_location, benchmark_cache, benchmark_provider = fetch_online_china_index_prices(
-        config["benchmark"]["symbol"],
-        config["start_date"],
-        config["end_date"],
-        cache_dir,
-        refresh_cache,
-    )
+    benchmark = config["benchmark"]
+    benchmark_adjustment = "index"
+    if config["market"] == "cn_a" and benchmark["type"] == "market_index":
+        benchmark_raw, benchmark_location, benchmark_cache, benchmark_provider = fetch_online_china_index_prices(
+            benchmark["symbol"],
+            config["start_date"],
+            config["end_date"],
+            cache_dir,
+            refresh_cache,
+        )
+    elif benchmark.get("instrument", {}).get("market") == "us":
+        api_key = os.environ.get("MARKETSIGNAL_TWELVE_DATA_API_KEY", "")
+        if not api_key:
+            raise MLTaskError("US market ML tasks require MARKETSIGNAL_TWELVE_DATA_API_KEY")
+        benchmark_raw, benchmark_location, benchmark_cache, benchmark_provider = fetch_online_us_adjusted_prices(
+            benchmark["instrument"]["provider_symbol"],
+            config["start_date"],
+            config["end_date"],
+            api_key,
+            30,
+            cache_dir,
+            refresh_cache,
+            currency=benchmark["currency"],
+        )
+        benchmark_adjustment = "adjusted_all"
+    else:
+        benchmark_raw, benchmark_location, benchmark_cache, benchmark_provider = fetch_online_china_adjusted_prices(
+            benchmark["instrument"],
+            config["start_date"],
+            config["end_date"],
+            cache_dir,
+            refresh_cache,
+        )
+        benchmark_adjustment = "qfq"
     benchmark_prices, benchmark_quality = clean_prices(benchmark_raw)
     benchmark_prices, benchmark_out_of_range = filter_prices_by_range(
         benchmark_prices, config["start_date"], config["end_date"]
     )
     for row in benchmark_prices:
-        row["adjustment"] = "index"
+        row["adjustment"] = benchmark_adjustment
     source_rows = [
         {
             "symbol": config["benchmark"]["symbol"],
+            "market": config["benchmark"]["market"],
+            "currency": config["benchmark"]["currency"],
             "dataset": "benchmark_prices",
             "provider": benchmark_provider,
             "status": "pass" if benchmark_prices else "fail",
@@ -698,7 +1091,7 @@ def run_ml_task(
             "raw_rows": benchmark_quality["raw_rows"],
             "clean_rows": benchmark_quality["clean_rows"],
             "output_rows": len(benchmark_prices),
-            "notes": f"out_of_range={benchmark_out_of_range}; explicit benchmark index",
+            "notes": f"out_of_range={benchmark_out_of_range}; adjustment={benchmark_adjustment}; explicit benchmark",
         }
     ]
     if not benchmark_prices:
@@ -706,22 +1099,41 @@ def run_ml_task(
 
     subjects: list[dict[str, Any]] = []
     for item in config["items"]:
-        raw_prices, price_location, price_cache, price_provider = fetch_online_china_adjusted_prices(
-            item["instrument"],
-            config["start_date"],
-            config["end_date"],
-            cache_dir,
-            refresh_cache,
-        )
+        if config["market"] == "us":
+            api_key = os.environ.get("MARKETSIGNAL_TWELVE_DATA_API_KEY", "")
+            if not api_key:
+                raise MLTaskError("US market ML tasks require MARKETSIGNAL_TWELVE_DATA_API_KEY")
+            raw_prices, price_location, price_cache, price_provider = fetch_online_us_adjusted_prices(
+                item["instrument"]["provider_symbol"],
+                config["start_date"],
+                config["end_date"],
+                api_key,
+                30,
+                cache_dir,
+                refresh_cache,
+                currency=item["currency"],
+            )
+            stock_adjustment = "adjusted_all"
+        else:
+            raw_prices, price_location, price_cache, price_provider = fetch_online_china_adjusted_prices(
+                item["instrument"],
+                config["start_date"],
+                config["end_date"],
+                cache_dir,
+                refresh_cache,
+            )
+            stock_adjustment = "qfq"
         prices, quality = clean_prices(raw_prices)
         prices, out_of_range = filter_prices_by_range(prices, config["start_date"], config["end_date"])
         for row in prices:
-            row["adjustment"] = "qfq"
+            row["adjustment"] = stock_adjustment
         if not prices:
             raise MLTaskError(f"{item['symbol']} returned no clean adjusted price rows")
         source_rows.append(
             {
                 "symbol": item["symbol"],
+                "market": item["market"],
+                "currency": item["currency"],
                 "dataset": "adjusted_prices",
                 "provider": price_provider,
                 "status": "pass",
@@ -730,14 +1142,14 @@ def run_ml_task(
                 "raw_rows": quality["raw_rows"],
                 "clean_rows": quality["clean_rows"],
                 "output_rows": len(prices),
-                "notes": f"adjustment=qfq; out_of_range={out_of_range}",
+                "notes": f"adjustment={stock_adjustment}; out_of_range={out_of_range}",
             }
         )
         financials: list[dict[str, Any]] = []
         news: list[dict[str, Any]] = []
         announcements: list[dict[str, Any]] = []
         if config["include_context"]:
-            financials, news, announcements, context_sources = _collect_context(
+            financials, news, announcements, context_sources = _collect_context_for_market(
                 item["instrument"],
                 config["start_date"],
                 config["end_date"],
@@ -764,6 +1176,13 @@ def run_ml_task(
         benchmark_source=benchmark_provider,
         horizons=config["horizons"],
         single_asset=single_asset,
+        market=config["market"],
+        calendar=config["calendar"],
+        timezone=config["timezone"],
+        benchmark_market=benchmark["market"],
+        benchmark_currency=benchmark["currency"],
+        benchmark_calendar=config["calendar"],
+        benchmark_timezone=config["timezone"],
     )
     result = run_ml_forecast_analysis(
         panel_rows,
@@ -779,7 +1198,23 @@ def run_ml_task(
         transaction_cost_bps=config["transaction_cost_bps"],
         slippage_bps=config["slippage_bps"],
         single_asset=single_asset,
+        market=config["market"],
+        calendar=config["calendar"],
+        benchmark_market=benchmark["market"],
+        benchmark_currency=benchmark["currency"],
+        benchmark_adjustment=benchmark_adjustment,
     )
+    for source_row in source_rows:
+        source_row.setdefault("market", config["market"])
+        source_row.setdefault("currency", config["items"][0]["currency"])
+        source_row.setdefault("calendar", config["calendar"])
+        source_row.setdefault("timezone", config["timezone"])
+        source_row.setdefault("adjustment_method", "")
+    for source_row in source_rows:
+        if source_row.get("dataset") == "benchmark_prices":
+            source_row["adjustment_method"] = benchmark_adjustment
+        elif source_row.get("dataset") == "adjusted_prices":
+            source_row["adjustment_method"] = "adjusted_all" if config["market"] == "us" else "qfq"
     output = config["output"]
     if not output.is_absolute():
         output = PROJECT_ROOT / output
@@ -790,6 +1225,9 @@ def run_ml_task(
         "output": str(output),
         "subjects": len(subjects),
         "benchmark_symbol": config["benchmark"]["symbol"],
+        "market": config["market"],
+        "currency": config["items"][0]["currency"],
+        "benchmark_currency": benchmark["currency"],
         "panel_rows": len(panel_rows),
         "features": len(feature_names),
         "forecasts": len(result["forecasts"]),
@@ -805,7 +1243,7 @@ def run_ml_task(
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Train and validate stage-six panel or stage-seven single-asset A-share excess-return models"
+        description="Train and validate multi-market panel or single-asset excess-return models"
     )
     parser.add_argument("--manifest", required=True, type=Path)
     parser.add_argument("--cache-dir", type=Path, default=DEFAULT_CACHE_DIR)

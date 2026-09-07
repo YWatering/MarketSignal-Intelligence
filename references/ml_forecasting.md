@@ -1,6 +1,6 @@
-# Stage-Six Machine-Learning Forecasting Rules
+# Benchmark-Relative Machine-Learning Forecasting Rules
 
-Read this reference for multi-stock machine-learning forecasts of benchmark-relative returns. Stage six is independent from the stage-five single-stock price forecast and does not silently replace it.
+Read this reference for stages six through eight machine-learning forecasts of benchmark-relative returns. These tasks are independent from the stage-five single-stock price forecast and do not silently replace it.
 
 ## Scope
 
@@ -126,3 +126,26 @@ The single-asset mode deliberately omits cross-sectional ranks, cross-sectional 
 For economic diagnostics, the predicted excess-return sign becomes a relative signal: positive predictions represent long-stock-versus-benchmark exposure, negative predictions represent the opposite relative exposure, and zero predictions are neutral. The workbook reports gross and net cumulative relative return, win rate, turnover, and maximum drawdown under no-cost, slippage-only, and base-cost scenarios. These outputs are research diagnostics and do not model executable fills, borrowing, taxes, capacity, or market impact.
 
 Historical membership is not applicable to one explicitly requested stock. The leakage report records this as a passed not-applicable check rather than claiming that the task reconstructs historical index membership.
+
+## Multi-Market Mode
+
+Stage eight adds manifest version `2.0` and applies the same target, model, validation, and admission logic to `cn_a`, `cn_b`, `hk`, and `us`. Version `1.0` A-share manifests remain supported.
+
+Each stage-eight task is isolated to one market and one local currency. The benchmark is explicit and must use the same market and currency as the stock universe. A panel requires at least two explicitly supplied stocks; a `single_asset` task requires exactly one. No cross-market panel, automatic benchmark replacement, implicit FX conversion, or transfer of model-selection results between markets is allowed.
+
+### Market Adapters
+
+| Market | Stock price route | Benchmark route | Adjustment label | Calendar and timezone |
+| --- | --- | --- | --- | --- |
+| `cn_a` | AKShare A-share history | AKShare A-share index or adjusted benchmark asset | `qfq` / `index` | `CN_A_SHARE` / `Asia/Shanghai` |
+| `cn_b` | AKShare B-share daily history | AKShare B-share adjusted benchmark asset | `qfq` | `CN_B_SHARE` / `Asia/Shanghai` |
+| `hk` | AKShare Hong Kong history | AKShare Hong Kong adjusted benchmark asset | `qfq` | `HKEX` / `Asia/Hong_Kong` |
+| `us` | Twelve Data time series | Twelve Data adjusted benchmark asset | `adjusted_all` | `NYSE_NASDAQ` / `America/New_York` |
+
+The implementation uses `exchange-calendars` sessions for target-date estimation. Stock and benchmark labels are still built only on their actual common dates, so a calendar-derived target date is an estimate for the next available session and does not override a suspension or source gap.
+
+US context data uses Yahoo Finance RSS for news and SEC EDGAR for entity mapping, financial facts, and filings. SEC `filed_date` remains the point-in-time boundary. Chinese and Hong Kong adapters keep their existing coverage limits visible in `数据来源`; unsupported announcement coverage is not replaced with inferred records.
+
+### Multi-Market Audit Fields
+
+The stage-eight sample, forecast, source, and leakage outputs retain `market`, `currency`, `calendar`, `timezone`, `benchmark_market`, `benchmark_currency`, `benchmark_adjustment`, and the stock adjustment method. The workbook adds `市场适配检查`, which summarizes the selected routes, adjustment labels, calendar, benchmark identity, context coverage, and status. The six candidate models are evaluated independently for each market, task type, and benchmark.

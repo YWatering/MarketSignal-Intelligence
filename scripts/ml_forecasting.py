@@ -1,4 +1,4 @@
-"""Panel machine-learning forecasts for benchmark-relative A-share returns."""
+"""Machine-learning forecasts for benchmark-relative multi-market returns."""
 
 from __future__ import annotations
 
@@ -6,7 +6,6 @@ import json
 import math
 import warnings
 from collections import defaultdict
-from datetime import datetime, timedelta
 from statistics import NormalDist
 from typing import Any, Iterable
 
@@ -26,6 +25,7 @@ from sklearn.metrics import (
 from sklearn.pipeline import Pipeline
 from sklearn.exceptions import ConvergenceWarning
 from forecasting import FEATURE_DESCRIPTIONS, FEATURE_WINDOW, build_feature_vector
+from market_calendar import next_trading_date
 from versioning import (
     ELASTIC_NET_MODEL_VERSION,
     EXCESS_MEAN_MODEL_VERSION,
@@ -178,6 +178,13 @@ def build_excess_return_panel(
     benchmark_source: str,
     horizons: Iterable[int] = (1, 5),
     single_asset: bool = False,
+    market: str = "cn_a",
+    calendar: str = "CN_A_SHARE",
+    timezone: str = "Asia/Shanghai",
+    benchmark_market: str = "cn_a",
+    benchmark_currency: str = "CNY",
+    benchmark_calendar: str = "CN_A_SHARE",
+    benchmark_timezone: str = "Asia/Shanghai",
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[str]]:
     """Build labeled and latest prediction rows using point-in-time features."""
     normalized_horizons = tuple(sorted({int(value) for value in horizons}))
@@ -219,6 +226,15 @@ def build_excess_return_panel(
             "benchmark_type": benchmark_type,
             "benchmark_source": benchmark_source,
             "adjustment": str(stock[-1].get("adjustment", "")),
+            "market": market,
+            "currency": str(subject.get("currency", "CNY")),
+            "calendar": calendar,
+            "timezone": timezone,
+            "benchmark_market": benchmark_market,
+            "benchmark_currency": benchmark_currency,
+            "benchmark_calendar": benchmark_calendar,
+            "benchmark_timezone": benchmark_timezone,
+            "benchmark_adjustment": str(aligned_benchmark[-1].get("adjustment", "")),
         }
         for horizon in normalized_horizons:
             for feature_index in range(60, len(stock) - horizon):
@@ -552,6 +568,13 @@ def _prediction_rows(
             "symbol": row["symbol"],
             "industry": row["industry"],
             "size_bucket": row["size_bucket"],
+            "market": row.get("market", "cn_a"),
+            "currency": row.get("currency", "CNY"),
+            "calendar": row.get("calendar", "CN_A_SHARE"),
+            "timezone": row.get("timezone", "Asia/Shanghai"),
+            "benchmark_market": row.get("benchmark_market", "cn_a"),
+            "benchmark_currency": row.get("benchmark_currency", "CNY"),
+            "benchmark_adjustment": row.get("benchmark_adjustment", "index"),
             "feature_date": row["feature_date"],
             "target_date": row["target_date"],
             "horizon": row["horizon"],
@@ -765,7 +788,17 @@ def _leakage_checks(
     benchmark_symbol: str,
     membership_policy: str,
     single_asset: bool = False,
+    market: str = "cn_a",
+    benchmark_adjustment: str = "index",
 ) -> list[dict[str, Any]]:
+    allowed_stock_adjustments = {"qfq", "adjusted_all", "adjusted_close"}
+    allowed_benchmark_adjustments = {
+        "index",
+        "index_level",
+        "qfq",
+        "adjusted_all",
+        "adjusted_close",
+    }
     checks = [
         {
             "check": "explicit_benchmark",
@@ -774,8 +807,18 @@ def _leakage_checks(
         },
         {
             "check": "adjusted_stock_prices",
-            "status": "pass" if all(row.get("adjustment") == "qfq" for row in rows + latest_rows) else "fail",
-            "details": "all stock-return labels must use qfq adjusted prices",
+            "status": "pass"
+            if all(row.get("adjustment") in allowed_stock_adjustments for row in rows + latest_rows)
+            else "fail",
+            "details": f"market={market}; all stock-return labels use a declared adjusted-price method",
+        },
+        {
+            "check": "benchmark_price_adjustment",
+            "status": "pass"
+            if benchmark_adjustment in allowed_benchmark_adjustments
+            and all(row.get("benchmark_adjustment") in allowed_benchmark_adjustments for row in rows + latest_rows)
+            else "fail",
+            "details": f"benchmark_adjustment={benchmark_adjustment}; benchmark prices use a declared method",
         },
         {
             "check": "feature_precedes_target",
@@ -888,14 +931,8 @@ def _explanation_rows(
     return results
 
 
-def _estimated_target_date(feature_date: str, horizon: int) -> str:
-    current = datetime.strptime(feature_date, "%Y-%m-%d")
-    steps = 0
-    while steps < horizon:
-        current += timedelta(days=1)
-        if current.weekday() < 5:
-            steps += 1
-    return current.strftime("%Y-%m-%d")
+def _estimated_target_date(feature_date: str, horizon: int, calendar: str = "CN_A_SHARE") -> str:
+    return next_trading_date(feature_date, horizon, calendar)
 
 
 def run_ml_forecast_analysis(
@@ -913,6 +950,11 @@ def run_ml_forecast_analysis(
     transaction_cost_bps: float = 10.0,
     slippage_bps: float = 5.0,
     single_asset: bool = False,
+    market: str = "cn_a",
+    calendar: str = "CN_A_SHARE",
+    benchmark_market: str = "cn_a",
+    benchmark_currency: str = "CNY",
+    benchmark_adjustment: str = "index",
 ) -> dict[str, Any]:
     """Run nested chronological validation without forcing an ML model to win."""
     if final_test_dates < 10 or outer_test_dates < 10 or inner_validation_dates < 10:
@@ -927,6 +969,8 @@ def run_ml_forecast_analysis(
         benchmark_symbol=benchmark_symbol,
         membership_policy=membership_policy,
         single_asset=single_asset,
+        market=market,
+        benchmark_adjustment=benchmark_adjustment,
     )
     blocking_leakage = any(row["status"] != "pass" for row in leakage_checks)
     rolling_rows: list[dict[str, Any]] = []
@@ -1185,8 +1229,15 @@ def run_ml_forecast_analysis(
                     "industry": row["industry"],
                     "size_bucket": row["size_bucket"],
                     "feature_date": row["feature_date"],
-                    "estimated_target_date": _estimated_target_date(row["feature_date"], horizon),
+                    "estimated_target_date": _estimated_target_date(row["feature_date"], horizon, calendar),
                     "benchmark_symbol": row["benchmark_symbol"],
+                    "market": row["market"],
+                    "currency": row["currency"],
+                    "calendar": row["calendar"],
+                    "timezone": row["timezone"],
+                    "benchmark_market": row["benchmark_market"],
+                    "benchmark_currency": row["benchmark_currency"],
+                    "benchmark_adjustment": row["benchmark_adjustment"],
                     "model_name": selected_model,
                     "model_version": MODEL_VERSIONS[selected_model],
                     "model_status": "selected",
@@ -1197,7 +1248,7 @@ def run_ml_forecast_analysis(
                     "lower_bound": float(prediction - interval),
                     "upper_bound": float(prediction + interval),
                     "interval_level": INTERVAL_LEVEL,
-                    "limitations": "research estimate; target date skips weekends but not exchange holidays or suspensions",
+                    "limitations": "research estimate; target date follows the configured exchange calendar, but suspensions and unscheduled closures remain data-dependent",
                 }
             )
         explanation_rows.extend(_explanation_rows(selected_fit, horizon_latest, feature_names))
@@ -1205,6 +1256,11 @@ def run_ml_forecast_analysis(
     return {
         "status": "pass" if not blocking_leakage else "warning",
         "task_type": "single_asset" if single_asset else "panel",
+        "market": market,
+        "calendar": calendar,
+        "benchmark_market": benchmark_market,
+        "benchmark_currency": benchmark_currency,
+        "benchmark_adjustment": benchmark_adjustment,
         "engine_version": ML_FORECAST_ENGINE_VERSION,
         "feature_version": ML_FEATURE_VERSION,
         "random_seed": RANDOM_SEED,

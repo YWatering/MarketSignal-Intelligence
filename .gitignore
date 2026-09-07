@@ -10,3 +10,6 @@ outputs/*.xlsx
 !outputs/china_liquor_batch.xlsx
 !outputs/china_a_ml_panel.xlsx
 !outputs/maotai_single_excess_return.xlsx
+!outputs/china_b_single_excess_return.xlsx
+!outputs/hk_single_excess_return.xlsx
+!outputs/us_single_excess_return.xlsx

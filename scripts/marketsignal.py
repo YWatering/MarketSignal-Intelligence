@@ -1041,34 +1041,64 @@ def fetch_online_china_adjusted_prices(
     cache_dir: Path | None,
     refresh_cache: bool,
 ) -> tuple[list[dict[str, Any]], str, str, str]:
-    """Fetch forward-adjusted A-share history for return modeling."""
-    if instrument["market"] != "cn_a":
-        raise PipelineError("stage-six adjusted-price collection currently supports China A shares only")
+    """Fetch forward-adjusted Chinese-market history for return modeling."""
     ak = _akshare_module()
     start = _date_argument(start_date, "1970-01-01")
     end = _date_argument(end_date, "2050-01-01")
-    candidates = [
-        (
-            "stock_zh_a_hist",
-            lambda: ak.stock_zh_a_hist(
-                symbol=instrument["code"],
-                period="daily",
-                start_date=start,
-                end_date=end,
-                adjust="qfq",
-                timeout=20,
+    if instrument["market"] == "cn_a":
+        candidates = [
+            (
+                "stock_zh_a_hist",
+                lambda: ak.stock_zh_a_hist(
+                    symbol=instrument["code"],
+                    period="daily",
+                    start_date=start,
+                    end_date=end,
+                    adjust="qfq",
+                    timeout=20,
+                ),
             ),
-        ),
-        (
-            "stock_zh_a_hist_tx",
-            lambda: ak.stock_zh_a_hist_tx(
-                symbol=f"{instrument['exchange_prefix'].lower()}{instrument['code']}",
-                start_date=start,
-                end_date=end,
-                adjust="qfq",
+            (
+                "stock_zh_a_hist_tx",
+                lambda: ak.stock_zh_a_hist_tx(
+                    symbol=f"{instrument['exchange_prefix'].lower()}{instrument['code']}",
+                    start_date=start,
+                    end_date=end,
+                    adjust="qfq",
+                ),
             ),
-        ),
-    ]
+        ]
+    elif instrument["market"] == "cn_b":
+        candidates = [
+            (
+                "stock_zh_b_daily",
+                lambda: ak.stock_zh_b_daily(
+                    symbol=f"{instrument['exchange_prefix'].lower()}{instrument['code']}",
+                    start_date=start,
+                    end_date=end,
+                    adjust="qfq",
+                ),
+            )
+        ]
+    elif instrument["market"] == "hk":
+        candidates = [
+            (
+                "stock_hk_hist",
+                lambda: ak.stock_hk_hist(
+                    symbol=instrument["code"],
+                    period="daily",
+                    start_date=start,
+                    end_date=end,
+                    adjust="qfq",
+                ),
+            ),
+            (
+                "stock_hk_daily",
+                lambda: ak.stock_hk_daily(symbol=instrument["code"], adjust="qfq"),
+            ),
+        ]
+    else:
+        raise PipelineError(f"adjusted Chinese-market prices are not configured for {instrument['market']}")
     errors: list[str] = []
     for function_name, loader in candidates:
         try:
@@ -1091,7 +1121,35 @@ def fetch_online_china_adjusted_prices(
             return rows, AKSHARE_DOC_URL, cache_status, provider
         except PipelineError as exc:
             errors.append(str(exc))
-    raise PipelineError("; ".join(errors) or "adjusted A-share price adapters returned no usable rows")
+    raise PipelineError("; ".join(errors) or "adjusted Chinese-market price adapters returned no usable rows")
+
+
+def fetch_online_us_adjusted_prices(
+    symbol: str,
+    start_date: str | None,
+    end_date: str | None,
+    api_key: str,
+    timeout: int,
+    cache_dir: Path,
+    refresh_cache: bool,
+    currency: str = "USD",
+) -> tuple[list[dict[str, Any]], str, str, str]:
+    """Fetch adjusted US history from Twelve Data for return modeling."""
+    rows, location, cache_status = fetch_online_prices(
+        symbol,
+        start_date,
+        end_date,
+        api_key,
+        timeout,
+        cache_dir,
+        refresh_cache,
+        "us",
+        currency,
+        adjustment="all",
+    )
+    for row in rows:
+        row["adjustment"] = "adjusted_all"
+    return rows, location, cache_status, "Twelve Data adjusted_all"
 
 
 def fetch_online_china_index_prices(
@@ -1530,6 +1588,7 @@ def fetch_online_prices(
     refresh_cache: bool,
     market: str = "us",
     currency: str = "USD",
+    adjustment: str | None = None,
 ) -> tuple[list[dict[str, Any]], str, str]:
     params = {
         "symbol": symbol,
@@ -1538,6 +1597,8 @@ def fetch_online_prices(
         "apikey": api_key,
         "timezone": "Exchange",
     }
+    if adjustment:
+        params["adjustment"] = adjustment
     if start_date:
         params["start_date"] = start_date
     if end_date:

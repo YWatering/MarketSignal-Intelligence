@@ -1,6 +1,6 @@
 ---
 name: market-signal-intelligence
-description: Collect and compare real stock data across China A shares, China B shares, Hong Kong stocks, and US stocks; clean prices, financial statements, notices, and news; validate sources; run leakage-aware price forecasts, single-asset benchmark-relative excess-return forecasts, or A-share panel machine-learning forecasts; export traceable Excel workbooks. Use for stock, portfolio, user-defined industry or theme research, repeatable task manifests, market sentiment, explainable forecasts, or strict out-of-sample model comparison.
+description: Collect and compare real stock data across China A shares, China B shares, Hong Kong stocks, and US stocks; clean prices, financial statements, notices, and news; validate sources; run leakage-aware price forecasts, market-isolated benchmark-relative excess-return forecasts, or multi-market panel machine-learning forecasts; export traceable Excel workbooks. Use for stock, portfolio, user-defined industry or theme research, repeatable task manifests, market sentiment, explainable forecasts, or strict out-of-sample model comparison.
 metadata:
   short-description: Real-data stock research, comparison, and forecasts to Excel
 ---
@@ -11,7 +11,7 @@ Use this skill for repeatable market-research workflows involving one or more ex
 
 ## Current Stage
 
-Stage seven provides all earlier collection, governance, and forecasting capabilities plus:
+Stage eight provides all earlier collection, governance, and forecasting capabilities plus:
 
 - A structured input contract for one stock, one market, and an optional date range.
 - Symbol parsing for China A shares (`cn_a`), China B shares (`cn_b`), Hong Kong stocks (`hk`), and US stocks (`us`).
@@ -31,7 +31,7 @@ Stage seven provides all earlier collection, governance, and forecasting capabil
 - Per-item retries, failure isolation, structured JSONL logs, and interval-based repeatable execution state.
 - Optional primary-versus-secondary price validation for China A shares and Hong Kong stocks.
 - Central versions for the Skill, contracts, source adapters, forecast engine, models, and Excel templates.
-- Forward-adjusted A-share price collection and explicit benchmark-index history for excess-return labels.
+- Forward-adjusted China-market price collection and explicit benchmark history for excess-return labels.
 - Versioned multi-stock machine-learning manifests with supplied industry, size, and membership metadata.
 - One-day and five-day excess-return targets, outperform probabilities, and same-cutoff cross-sectional ranks.
 - Zero-excess, historical-mean, panel Ridge, Elastic Net, Random Forest, and histogram gradient boosting candidates.
@@ -39,11 +39,16 @@ Stage seven provides all earlier collection, governance, and forecasting capabil
 - Regression, rank, direction, probability-calibration, grouped-spread, turnover, cost, and drawdown evaluation.
 - Model states and rejection reasons that allow simple models to remain selected when machine learning fails its gates.
 - Global feature importance, model-agnostic local prediction differences, and explicit leakage checks.
-- A separate `single_asset` task type for one A-share stock relative to one explicitly supplied benchmark index.
+- A separate `single_asset` task type for one stock relative to one explicitly supplied same-market benchmark asset or index.
 - Single-stock time-series excess-return targets, outperform probability, direction, empirical intervals, and relative-to-benchmark cost evaluation.
 - Single-stock validation that retains chronological purging and final-holdout governance while omitting cross-sectional ranks and grouped portfolio tests.
+- Multi-market ML manifests for `cn_a`, `cn_b`, `hk`, and `us`, with same-market and same-currency enforcement.
+- Market-specific adjusted-price routes: AKShare `qfq` for Chinese and Hong Kong assets, and Twelve Data `adjustment=all` for US assets.
+- Real exchange-session calendars through `exchange-calendars` for China, Hong Kong, and US target-date estimation.
+- Market, currency, timezone, calendar, benchmark, adjustment, and source fields in ML samples, forecasts, source records, and the `市场适配检查` sheet.
+- SEC Company Facts and submissions plus Yahoo Finance RSS context collection in US ML tasks, with explicit credential and coverage failures.
 
-Stage six and seven do not automatically discover industry or theme constituents, reconstruct historical index membership without supplied records, run an always-on scheduler, provide causal claims, guarantee returns, implement advanced sentiment models, or apply exchange-holiday calendars. Do not present a forecast as investment advice or certainty.
+Stage eight does not automatically discover industry or theme constituents, reconstruct historical index membership without supplied records, mix markets or currencies in one panel, run an always-on scheduler, provide causal claims, guarantee returns, implement advanced sentiment models, or perform FX conversion. Do not present a forecast as investment advice or certainty.
 
 ## Workflow
 
@@ -51,8 +56,8 @@ Stage six and seven do not automatically discover industry or theme constituents
 2. For a single stock, read [references/data_contract.md](references/data_contract.md) before changing fields, market routing, or output sheets. For price prediction requests, also read [references/forecasting.md](references/forecasting.md).
 3. For multiple stocks or repeatable tasks, read [references/batch_contract.md](references/batch_contract.md). For source consistency, retries, logs, scheduling state, or versions, read [references/operations.md](references/operations.md).
 4. Use online mode for current Chinese-market research when AKShare and network access are available. Use online US mode only when the Twelve Data key, SEC User-Agent, and required network access are available.
-5. Run `scripts/marketsignal.py` for one stock, `scripts/market_batch.py` for a stage-five manifest, or `scripts/market_ml.py` for a stage-six panel or stage-seven `single_asset` task. Read [references/ml_forecasting.md](references/ml_forecasting.md) before changing machine-learning targets, splits, gates, or sheets.
-6. For Chinese markets, inspect source and cache status. Request price cross-validation when the user needs source consistency evidence; unsupported markets must be reported explicitly.
+5. Run `scripts/marketsignal.py` for one stock, `scripts/market_batch.py` for a stage-five manifest, or `scripts/market_ml.py` for a stage-six, stage-seven, or stage-eight ML task. Read [references/ml_forecasting.md](references/ml_forecasting.md) before changing machine-learning targets, splits, gates, or sheets.
+6. For Chinese and Hong Kong markets, inspect source and cache status. For US tasks, inspect Twelve Data adjustment status, SEC identity mapping, Yahoo RSS coverage, and credential status. Request price cross-validation when the user needs source consistency evidence; unsupported markets must be reported explicitly.
 7. For forecasting, use only records returned and cleaned by the current single-stock run. Reject fixture rows, enforce point-in-time availability, keep future external features fixed at the last real data cutoff, and inspect `模型评估`, `模型稳健性`, and `成本敏感性` before interpreting the selected model.
 8. Treat missing, invalid, duplicated, out-of-range, unsupported, source-failed, mismatched, or insufficient-history records as quality signals. Keep completed batch items when another item fails.
 9. Deliver all workbook paths and summarize per-item status, attempts, source validation, market, currency, data cutoff, row counts, selected model, validation metrics, forecast interval, limitations, and quality warnings.
@@ -99,6 +104,22 @@ Run the stage-seven single-asset excess-return task:
 .venv/bin/python scripts/market_ml.py --manifest examples/china_maotai_single_excess_return.yaml
 ```
 
+Run the stage-eight China B-share or Hong Kong single-asset task:
+
+```bash
+.venv/bin/python scripts/market_ml.py --manifest examples/china_b_single_excess_return.yaml --validate-only
+.venv/bin/python scripts/market_ml.py --manifest examples/china_b_single_excess_return.yaml
+.venv/bin/python scripts/market_ml.py --manifest examples/hk_single_excess_return.yaml
+```
+
+Run the stage-eight US task after setting both required credentials:
+
+```bash
+export MARKETSIGNAL_TWELVE_DATA_API_KEY="your-key"
+export MARKETSIGNAL_SEC_USER_AGENT="MarketSignal Intelligence contact@example.com"
+.venv/bin/python scripts/market_ml.py --manifest examples/us_single_excess_return.yaml
+```
+
 Run a Hong Kong stock report:
 
 ```bash
@@ -124,7 +145,7 @@ Run the validation suite:
 | `cn_a` | AKShare A-share history with Tencent fallback | AKShare stock news | AKShare profit, balance-sheet, and cash-flow reports | AKShare individual notices |
 | `cn_b` | AKShare B-share daily history | AKShare stock news | AKShare profit, balance-sheet, and cash-flow reports | AKShare individual notices when usable rows are returned |
 | `hk` | AKShare Hong Kong history with daily fallback | AKShare stock news | AKShare annual Hong Kong reports and company profile | Not configured in this stage |
-| `us` | Twelve Data | Yahoo Finance RSS | SEC Company Facts | SEC submissions |
+| `us` | Twelve Data adjusted history (`adjustment=all`) | Yahoo Finance RSS | SEC Company Facts | SEC submissions |
 
 ## Output Rules
 
@@ -133,9 +154,10 @@ Run the validation suite:
 - Include entity mapping, financial-reporting period, filing or notice date, accession number when available, calculation method, and source location where applicable.
 - For forecasts, include data cutoff, training and validation ranges, all candidate models, baseline comparison, model version, validation method, error metrics, selection thresholds and reasons, robustness windows, cost assumptions, interval method, backtest details, and feature coefficients.
 - For multi-stock tasks, require an explicit versioned manifest and retain every normalized constituent, attempt count, output path, and isolated failure.
-- For stage-six tasks, require forward-adjusted stock prices, one explicit benchmark, one common prediction cutoff, purged nested time validation, and a final holdout used only for acceptance.
-- For stage-seven `single_asset` tasks, require one explicit stock, one explicit benchmark, common stock/index dates, point-in-time features, purged nested time validation, and a final holdout used only for acceptance.
-- For stage-seven tasks, do not create cross-sectional ranks, high-minus-low groups, or grouped-spread results; evaluate the predicted direction as a single-stock relative-to-benchmark research signal.
+- For stage-six and stage-seven A-share tasks, retain backward-compatible version `1.0` manifests and existing output fields.
+- For stage-eight tasks, require a version `2.0` manifest, one explicit same-market benchmark, common currency, declared adjusted-price method, market calendar, purged nested time validation, and a final holdout used only for acceptance.
+- For `single_asset` tasks, do not create cross-sectional ranks, high-minus-low groups, or grouped-spread results; evaluate the predicted direction as a single-stock relative-to-benchmark research signal.
+- Do not create a formal label when the stock and benchmark do not have a declared compatible adjustment method or common currency.
 - Do not promote a machine-learning model when fixed-universe survivorship risk or another leakage check remains unresolved.
 - When cross-validation is requested, compare aligned closes without replacing the primary series; report unsupported adapters or mismatches.
 - Include the central component versions in every workbook and keep output schemas compatible with the declared contract version.

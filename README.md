@@ -2,7 +2,7 @@
 
 MarketSignal Intelligence 是一个面向中国股票市场和美国股票市场的 Agent Skill。它可以针对单只或多只明确指定的股票采集行情、财务、公告与相关新闻，完成清洗、去重、范围处理、中文或英文关键词舆情分类、指标计算、数据质量检查、预测、横向比较和可追溯 Excel 交付。
 
-当前仓库已完成阶段七：在阶段五单股价格预测、阶段六多股票超额收益面板基础上，新增单只 A 股相对显式基准指数的超额收益预测模式、单股时间序列验证和单股相对基准成本评价。
+当前仓库已完成阶段八：在阶段五单股价格预测、阶段六多股票超额收益面板和阶段七单股超额收益模式基础上，新增面向 A 股、B 股、港股和美股的市场隔离超额收益机器学习预测能力。
 
 ## 当前能力
 
@@ -41,6 +41,10 @@ MarketSignal Intelligence 是一个面向中国股票市场和美国股票市场
 - 支持 `single_asset` 单股模式：使用一只 A 股和一个显式基准指数计算并预测未来 1 日、5 日或自定义周期的超额收益率。
 - 单股模式保留个股、基准、财务、新闻和公告的点时特征，但不生成不适用的横截面排名、高低组和分组检验。
 - 将预测方向转换为单股相对基准信号，输出方向准确率、跑赢概率、累计相对收益、换手率和成本后回撤。
+- 阶段八支持四类市场的同市场、同币种单股或面板超额收益预测，不自动进行跨市场或跨币种混合。
+- B 股和港股使用 AKShare 前复权行情；美股使用 Twelve Data `adjustment=all` 调整行情，并在来源与泄漏检查中保留调整方法。
+- 使用 `exchange-calendars` 的交易所会话日历处理 A 股、B 股、港股和美股的目标交易日，不再只跳过周末。
+- 阶段八工作簿增加 `市场适配检查`，记录市场、币种、时区、交易日历、基准、复权方式、来源和上下文数据覆盖。
 
 ## 支持的市场代码
 
@@ -223,6 +227,35 @@ export MARKETSIGNAL_SEC_USER_AGENT="MarketSignal Intelligence contact@example.co
 
 阶段七工作簿包括 `README`、`单股样本`、`单股超额收益预测`、`模型排行榜`、`滚动验证`、`特征重要性`、`预测解释`、`成本敏感性`、`数据泄漏检查`、`最终测试明细`、`参数搜索`、`数据来源` 和 `模型版本`；单股模式不生成 `分组检验`。
 
+## 阶段八多市场超额收益机器学习预测
+
+阶段八将阶段六和阶段七的超额收益模型扩展到中国 B 股、港股和美股，同时保留 A 股入口兼容。每次任务必须显式指定市场、股票和同市场基准；面板任务还必须使用同一币种。系统不会把不同市场的股票、基准或模型结果混在一起。
+
+清单验证：
+
+```bash
+.venv/bin/python scripts/market_ml.py --manifest examples/china_b_single_excess_return.yaml --validate-only
+.venv/bin/python scripts/market_ml.py --manifest examples/hk_single_excess_return.yaml --validate-only
+.venv/bin/python scripts/market_ml.py --manifest examples/us_single_excess_return.yaml --validate-only
+```
+
+执行 B 股或港股真实预测：
+
+```bash
+.venv/bin/python scripts/market_ml.py --manifest examples/china_b_single_excess_return.yaml
+.venv/bin/python scripts/market_ml.py --manifest examples/hk_single_excess_return.yaml
+```
+
+执行美股真实预测前，需要配置 Twelve Data 行情凭据和带联系邮箱的 SEC User-Agent：
+
+```bash
+export MARKETSIGNAL_TWELVE_DATA_API_KEY="your-key"
+export MARKETSIGNAL_SEC_USER_AGENT="MarketSignal Intelligence contact@example.com"
+.venv/bin/python scripts/market_ml.py --manifest examples/us_single_excess_return.yaml
+```
+
+阶段八继续使用六类候选模型、嵌套时序验证、独立最终测试、模型准入、单股相对基准成本敏感性和点时财务/新闻/公告特征。B 股和港股使用 `qfq`，美股使用 `adjusted_all`；若缺少调整价格、同币种基准或必需凭据，任务会明确失败，不会使用未调整价格或猜测数据替代。
+
 ## 阶段四多主体任务
 
 批量任务使用版本化清单。`portfolio`、`industry` 和 `theme` 都要求明确列出股票，不自动猜测行业或主题成分。
@@ -332,6 +365,7 @@ outputs/china_liquor_batch.xlsx
 | `分组检验` | 高、中、低预测组的实际超额收益和胜率。 |
 | `成本敏感性` | 高减低组合在不同成本场景下的收益、换手和回撤。 |
 | `数据泄漏检查` | 复权、基准、时间边界、重叠标签、随机切分和历史成分检查。 |
+| `市场适配检查` | 市场、币种、时区、交易日历、基准、复权方法和上下文覆盖状态。 |
 | `最终测试明细` | 完全隔离的最终测试预测与实际结果。 |
 | `参数搜索` | 内部验证使用的有限参数组合及误差。 |
 | `模型版本` | 契约、引擎、特征、模型版本和随机种子。 |
@@ -349,7 +383,8 @@ outputs/china_liquor_batch.xlsx
 ├── scripts/marketsignal.py     # 多市场采集、清洗、指标计算和 Excel 导出
 ├── scripts/forecasting.py      # 特征构造、走步回测、模型训练和未来预测
 ├── scripts/market_batch.py     # 多主体清单、重试、隔离、调度状态和汇总导出
-├── scripts/market_ml.py        # 阶段六面板、阶段七单股清单和 Excel 导出
+├── scripts/market_ml.py        # 阶段六至阶段八清单、市场路由和 Excel 导出
+├── scripts/market_calendar.py  # 交易所会话日历与目标日推算
 ├── scripts/ml_forecasting.py   # 超额收益面板、机器学习、嵌套验证和准入规则
 ├── scripts/operations.py       # 结构化日志、重试、间隔判断和行情交叉校验
 ├── scripts/versioning.py       # 组件版本注册表
@@ -359,7 +394,7 @@ outputs/china_liquor_batch.xlsx
 ├── fixtures/                   # 美股行情、新闻、主体、财务和申报测试数据
 ├── references/data_contract.md # 输入、输出、数据字段和错误约定
 ├── references/forecasting.md   # 阶段五模型、选择、防泄漏和评估规则
-├── references/ml_forecasting.md # 阶段六目标、模型、嵌套验证和治理规则
+├── references/ml_forecasting.md # 阶段六至阶段八目标、模型、嵌套验证和治理规则
 ├── references/batch_contract.md # 阶段五批量任务清单契约
 ├── references/operations.md    # 交叉校验、重试、日志、调度和版本规则
 ├── tests/                      # 自动化测试
@@ -377,7 +412,7 @@ outputs/china_liquor_batch.xlsx
 .venv/bin/python scripts/run_acceptance.py
 ```
 
-42 项测试覆盖早期阶段回归、四类市场、数据治理、真实数据预测、时间可用性、多主体清单、重试恢复、失败隔离、调度间隔、行情交叉校验、版本注册、五模型选择、阶段六面板标签、嵌套时序验证、模型准入、阶段七单股标签和 Excel 契约。`run_acceptance.py` 使用固定样例执行完整批量入口、单股报告和汇总报告验收。阶段实施方式与实际验证记录见 [工作计划.md](工作计划.md)。
+48 项测试覆盖早期阶段回归、四类市场、数据治理、真实数据预测、时间可用性、多主体清单、重试恢复、失败隔离、调度间隔、行情交叉校验、版本注册、六模型选择、阶段六面板标签、嵌套时序验证、模型准入、阶段七单股标签、阶段八市场路由、交易日历、币种隔离和 Excel 契约。`run_acceptance.py` 使用固定样例执行完整批量入口、单股报告和汇总报告验收。阶段实施方式与实际验证记录见 [工作计划.md](工作计划.md)。
 
 ## 使用边界
 
@@ -387,7 +422,7 @@ outputs/china_liquor_batch.xlsx
 - B 股交易币种按交易所区分为上海 USD、深圳 HKD；财务报表若提供自身货币字段，则以报表货币字段为准。
 - 新闻分类是小型可解释关键词规则，不等同于通用情感模型。
 - 预测使用历史关系估计未来，不代表因果关系；突发事件、停牌、涨跌停、制度变化和数据源变化都可能使模型失效。
-- 未来交易日目前按周一至周五估算，不包含交易所节假日日历；预测区间是基于回测误差的经验区间，不是收益保证。
+- 阶段五绝对价格预测仍按其既有周末规则处理；阶段六至阶段八超额收益预测使用 `exchange-calendars` 交易所会话估算目标日，但停牌和临时闭市仍依赖实际行情数据。
 - 多步预测采用递归价格路径，未来新闻、公告和财务输入固定在数据截止点，因此预测步数越远，不确定性越高。
 - 行业和主题任务不会自动发现成分股，需要用户提供明确列表；当前横向比较不执行自动选股或组合优化。
 - 仓库提供可重复调用和间隔判断，不运行常驻调度服务；实际触发频率由外部调度器负责。

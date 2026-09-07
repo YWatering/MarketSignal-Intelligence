@@ -255,7 +255,7 @@ The normalized panel key is:
 symbol + feature_date + target_date + horizon
 ```
 
-Each row records adjusted stock return, benchmark return, excess return, outperform label, benchmark identity, membership metadata, adjustment method, and a feature mapping. Stock labels must use `qfq` prices. The final test is stored separately and is never used to alter the feature set, parameter grid, or outer-window candidate.
+Each row records adjusted stock return, benchmark return, excess return, outperform label, benchmark identity, membership metadata, adjustment method, and a feature mapping. Version `1.0` A-share labels use `qfq` prices. The final test is stored separately and is never used to alter the feature set, parameter grid, or outer-window candidate.
 
 See [ml_forecasting.md](ml_forecasting.md) for feature, model, validation, promotion, explanation, and workbook rules.
 
@@ -316,6 +316,32 @@ The formal single-asset workbook contains:
 | `模型版本` | Contract, feature, engine, model, workbook, and random-seed versions. |
 
 The single-asset workbook intentionally does not include `分组检验`. Its cost evaluation reports a sign-of-prediction relative strategy: long the stock versus the benchmark when predicted excess return is positive, short the relative signal when negative, and remain neutral when the prediction is zero. This is a research diagnostic, not an executable trading instruction or a return guarantee.
+
+## Multi-Market Machine-Learning Contract
+
+Stage eight adds manifest version `2.0` for market-isolated excess-return tasks. It supports `cn_a`, `cn_b`, `hk`, and `us` for both `single_asset` and same-market `panel` tasks. Existing version `1.0` A-share manifests remain valid for backward compatibility.
+
+Stage-eight manifests must provide:
+
+- `market`, one or more symbols valid for that market, and one explicit benchmark in the same market;
+- a common stock and benchmark currency; implicit FX conversion is not performed;
+- `mode: online`, a business-data range, one or more horizons from 1 to 20, and an `.xlsx` output path;
+- versioned validation and cost settings using the same nested chronological split contract as stages six and seven.
+
+Market-specific price labels are declared as follows:
+
+| Market | Stock adjustment | Benchmark adjustment | Calendar | Local currency examples |
+| --- | --- | --- | --- | --- |
+| `cn_a` | `qfq` | `index_level` for an A-share index, or `qfq` for a benchmark asset | `CN_A_SHARE` | CNY |
+| `cn_b` | `qfq` | `qfq` for a benchmark asset | `CN_B_SHARE` | Shanghai USD; Shenzhen HKD |
+| `hk` | `qfq` | `qfq` for a benchmark asset | `HKEX` | HKD |
+| `us` | `adjusted_all` | `adjusted_all` | `NYSE_NASDAQ` | USD |
+
+Stage-eight normalized sample and forecast rows retain `market`, `currency`, `calendar`, `timezone`, `benchmark_market`, `benchmark_currency`, `benchmark_adjustment`, and the stock `adjustment` method. The target date is derived from the configured exchange session calendar, while labels use only dates present in both the stock and benchmark series. Cross-market panels, cross-currency excess returns, automatic benchmark substitution, and use of unadjusted prices as a fallback are prohibited.
+
+For US tasks, price history uses Twelve Data adjusted history. When context collection is enabled, Yahoo Finance RSS supplies news and SEC EDGAR supplies ticker mapping, Company Facts, and 10-K, 10-Q, and 8-K filing history. Missing API keys, invalid SEC contact identity, failed source requests, and empty coverage are retained as explicit errors or warnings.
+
+The stage-eight workbook adds `市场适配检查` and expands `README`, sample, forecast, source, leakage, and version fields with market, currency, calendar, timezone, benchmark, and adjustment metadata. The six candidate models and all nested validation, final-holdout, model-admission, cost, and explanation rules remain unchanged and are recalculated independently for each market and task.
 
 ## Error Behavior
 

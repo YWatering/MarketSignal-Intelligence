@@ -1,0 +1,23 @@
+version: "2.0"
+name: hong-kong-single-excess-return
+task_type: single_asset
+market: hk
+mode: online
+symbol: "00700.HK"
+label: 腾讯控股
+start_date: 2023-01-01
+end_date: latest
+horizons: [1, 5]
+benchmark:
+  symbol: "02800.HK"
+  label: 盈富基金
+  type: benchmark_asset
+include_context: true
+final_test_dates: 40
+outer_test_dates: 20
+outer_folds: 3
+inner_validation_dates: 20
+minimum_training_dates: 120
+transaction_cost_bps: 10
+slippage_bps: 5
+output: outputs/hk_single_excess_return.xlsx

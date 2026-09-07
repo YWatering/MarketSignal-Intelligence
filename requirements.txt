@@ -4,3 +4,4 @@ numpy>=2,<3
 openpyxl>=3.1,<4
 PyYAML>=6,<7
 scikit-learn>=1.7,<1.8
+exchange-calendars>=4,<5
