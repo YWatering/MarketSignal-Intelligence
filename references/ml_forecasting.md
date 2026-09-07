@@ -100,3 +100,29 @@ Global importance uses coefficients, built-in tree importance, or training-only 
 The stage-six workbook includes `README`, `面板样本`, `机器学习预测`, `模型排行榜`, `滚动验证`, `特征重要性`, `预测解释`, `分组检验`, `成本敏感性`, `数据泄漏检查`, `最终测试明细`, `参数搜索`, `数据来源`, and `模型版本`.
 
 Business dates remain in the data. OOXML document creation, update, and generation time metadata is removed.
+
+## Single-Asset Mode
+
+Stage seven adds `task_type: single_asset` without changing the panel contract. The task must contain exactly one explicitly supplied A-share stock and one explicitly supplied benchmark index. Stock and benchmark prices are aligned on common trading dates before labels and features are built.
+
+Single-asset targets use the same definition:
+
+```text
+stock_return(h) = adjusted_close(t+h) / adjusted_close(t) - 1
+benchmark_return(h) = benchmark_close(t+h) / benchmark_close(t) - 1
+excess_return(h) = stock_return(h) - benchmark_return(h)
+outperformed(h) = 1 when excess_return(h) > 0, otherwise 0
+```
+
+The single-asset mode keeps the following controls:
+
+- Forward-adjusted stock prices and an explicit benchmark identity.
+- Point-in-time financial, news, notice, stock, and benchmark-context features.
+- Inner chronological parameter selection, purged outer windows, and a locked final holdout.
+- The same six candidates, model states, rejection reasons, interval construction, and version registry.
+
+The single-asset mode deliberately omits cross-sectional ranks, cross-sectional prediction ranks, high-minus-low groups, and grouped-spread tests. Time-series IC or Rank IC may be reported only over the available chronological evaluation rows and must identify its evaluation scope.
+
+For economic diagnostics, the predicted excess-return sign becomes a relative signal: positive predictions represent long-stock-versus-benchmark exposure, negative predictions represent the opposite relative exposure, and zero predictions are neutral. The workbook reports gross and net cumulative relative return, win rate, turnover, and maximum drawdown under no-cost, slippage-only, and base-cost scenarios. These outputs are research diagnostics and do not model executable fills, borrowing, taxes, capacity, or market impact.
+
+Historical membership is not applicable to one explicitly requested stock. The leakage report records this as a passed not-applicable check rather than claiming that the task reconstructs historical index membership.

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run the stage-six A-share excess-return machine-learning workflow."""
+"""Run stage-six panel or stage-seven single-asset excess-return workflows."""
 
 from __future__ import annotations
 
@@ -34,12 +34,13 @@ from marketsignal import (
     parse_symbol,
 )
 from ml_forecasting import MLForecastError, build_excess_return_panel, run_ml_forecast_analysis
-from versioning import ML_PANEL_CONTRACT_VERSION, component_versions
+from versioning import ML_PANEL_CONTRACT_VERSION, SINGLE_ASSET_CONTRACT_VERSION, component_versions
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_CACHE_DIR = PROJECT_ROOT / ".cache" / "marketsignal"
 ALLOWED_MEMBERSHIP_POLICIES = {"user_supplied_fixed_universe", "historical_constituents"}
+ALLOWED_TASK_TYPES = {"panel", "single_asset"}
 
 
 class MLTaskError(RuntimeError):
@@ -87,17 +88,21 @@ def _non_negative_float(value: Any, field: str) -> float:
 
 
 def validate_manifest(payload: dict[str, Any]) -> dict[str, Any]:
-    if str(payload.get("version", "")) != ML_PANEL_CONTRACT_VERSION:
+    version = str(payload.get("version", ""))
+    if version not in {ML_PANEL_CONTRACT_VERSION, SINGLE_ASSET_CONTRACT_VERSION}:
         raise MLTaskError(
             f"ML manifest version must be {ML_PANEL_CONTRACT_VERSION}; received {payload.get('version', 'missing')}"
         )
     name = str(payload.get("name", "")).strip()
     if not name:
         raise MLTaskError("ML manifest requires a non-empty name")
+    task_type = str(payload.get("task_type", "panel")).strip() or "panel"
+    if task_type not in ALLOWED_TASK_TYPES:
+        raise MLTaskError(f"task_type must be one of: {', '.join(sorted(ALLOWED_TASK_TYPES))}")
     if str(payload.get("market", "cn_a")) != "cn_a":
-        raise MLTaskError("stage-six online collection currently supports market=cn_a only")
+        raise MLTaskError("stage-six/stage-seven online collection currently supports market=cn_a only")
     if str(payload.get("mode", "online")) != "online":
-        raise MLTaskError("formal stage-six forecasts require mode=online")
+        raise MLTaskError("formal stage-six/stage-seven forecasts require mode=online")
     start_date = _date_value(payload.get("start_date"), "start_date")
     end_date = _date_value(payload.get("end_date", "latest"), "end_date")
     if start_date > end_date:
@@ -115,15 +120,28 @@ def validate_manifest(payload: dict[str, Any]) -> dict[str, Any]:
     if any(value < 1 or value > 20 for value in horizons):
         raise MLTaskError("horizons must contain trading-step values from 1 to 20")
     membership_policy = str(payload.get("membership_policy", "user_supplied_fixed_universe"))
-    if membership_policy not in ALLOWED_MEMBERSHIP_POLICIES:
+    if task_type == "single_asset":
+        membership_policy = "single_asset"
+    if task_type == "panel" and membership_policy not in ALLOWED_MEMBERSHIP_POLICIES:
         raise MLTaskError(
             f"membership_policy must be one of: {', '.join(sorted(ALLOWED_MEMBERSHIP_POLICIES))}"
         )
-    items = payload.get("items")
-    if not isinstance(items, list) or len(items) < 2:
-        raise MLTaskError("ML manifest requires at least two explicitly supplied A-share items")
-    if len(items) > 30:
-        raise MLTaskError("ML manifest supports at most 30 items per run")
+    if task_type == "single_asset":
+        items = [
+            {
+                "symbol": payload.get("symbol", ""),
+                "label": payload.get("label", ""),
+                "industry": payload.get("industry", "未分类"),
+                "size_bucket": payload.get("size_bucket", "未分类"),
+                "membership_source": "single_asset",
+            }
+        ]
+    else:
+        items = payload.get("items")
+        if not isinstance(items, list) or len(items) < 2:
+            raise MLTaskError("ML manifest requires at least two explicitly supplied A-share items")
+        if len(items) > 30:
+            raise MLTaskError("ML manifest supports at most 30 items per run")
     normalized_items: list[dict[str, Any]] = []
     seen: set[str] = set()
     for index, item in enumerate(items, start=1):
@@ -148,12 +166,14 @@ def validate_manifest(payload: dict[str, Any]) -> dict[str, Any]:
                 "membership_source": str(item.get("membership_source", membership_policy)),
             }
         )
-    output = Path(str(payload.get("output", "outputs/china_ml_panel.xlsx")))
+    default_output = "outputs/maotai_single_excess_return.xlsx" if task_type == "single_asset" else "outputs/china_ml_panel.xlsx"
+    output = Path(str(payload.get("output", default_output)))
     if output.suffix.lower() != ".xlsx":
         raise MLTaskError("output must use the .xlsx extension")
     return {
-        "version": ML_PANEL_CONTRACT_VERSION,
+        "version": version,
         "name": name,
+        "task_type": task_type,
         "market": "cn_a",
         "mode": "online",
         "start_date": start_date,
@@ -264,13 +284,21 @@ def build_ml_workbook(
     result: dict[str, Any],
     source_rows: list[dict[str, Any]],
 ) -> None:
+    single_asset = config.get("task_type", "panel") == "single_asset"
     workbook = Workbook()
     workbook.remove(workbook.active)
     workbook.properties.creator = "MarketSignal Intelligence"
     workbook.properties.title = "MarketSignal Intelligence ML excess-return report"
 
     readme_rows = [
-        ["task_name", config["name"], "Versioned multi-stock panel task"],
+        [
+            "task_name",
+            config["name"],
+            "Versioned single-stock excess-return task"
+            if single_asset
+            else "Versioned multi-stock panel task",
+        ],
+        ["task_type", config.get("task_type", "panel"), "single_asset uses one stock relative to the explicit benchmark"],
         ["market", config["market"], "First implementation supports China A shares"],
         ["benchmark_symbol", config["benchmark"]["symbol"], config["benchmark"]["label"]],
         ["benchmark_type", config["benchmark"]["type"], "Explicit benchmark; no automatic substitution"],
@@ -281,7 +309,7 @@ def build_ml_workbook(
         ["membership_policy", config["membership_policy"], "Controls survivorship-bias status"],
         ["pipeline_status", result["status"], "Review 数据泄漏检查 and 模型排行榜"],
         ["panel_rows", len(result["panel_rows"]), "Labeled stock-date-horizon observations"],
-        ["feature_count", len(result["feature_names"]), "Point-in-time and cross-sectional features"],
+        ["feature_count", len(result["feature_names"]), "Point-in-time features; cross-sectional ranks only in panel mode"],
         ["random_seed", result["random_seed"], "Fixed for repeatable fitted models"],
         ["limitations", result["limitations"], "Research output; not investment advice"],
     ]
@@ -291,24 +319,41 @@ def build_ml_workbook(
     readme = workbook.create_sheet("README")
     _write_table(readme, ["field", "value", "notes"], readme_rows)
 
-    panel_headers = [
-        "symbol",
-        "label",
-        "industry",
-        "size_bucket",
-        "horizon",
-        "feature_date",
-        "target_date",
-        "benchmark_symbol",
-        "stock_return",
-        "benchmark_return",
-        "excess_return",
-        "outperformed",
-        "membership_source",
-        "adjustment",
-        *result["feature_names"],
-    ]
-    panel_sheet = workbook.create_sheet("面板样本")
+    panel_headers = (
+        [
+            "symbol",
+            "label",
+            "horizon",
+            "feature_date",
+            "target_date",
+            "benchmark_symbol",
+            "stock_return",
+            "benchmark_return",
+            "excess_return",
+            "outperformed",
+            "adjustment",
+            *result["feature_names"],
+        ]
+        if single_asset
+        else [
+            "symbol",
+            "label",
+            "industry",
+            "size_bucket",
+            "horizon",
+            "feature_date",
+            "target_date",
+            "benchmark_symbol",
+            "stock_return",
+            "benchmark_return",
+            "excess_return",
+            "outperformed",
+            "membership_source",
+            "adjustment",
+            *result["feature_names"],
+        ]
+    )
+    panel_sheet = workbook.create_sheet("单股样本" if single_asset else "面板样本")
     panel_values = []
     for row in result["panel_rows"]:
         flat = {**row, **row["features"]}
@@ -320,27 +365,54 @@ def build_ml_workbook(
         "0.000000",
     )
 
-    forecast_headers = [
-        "horizon",
-        "symbol",
-        "label",
-        "industry",
-        "size_bucket",
-        "feature_date",
-        "estimated_target_date",
-        "benchmark_symbol",
-        "model_name",
-        "model_version",
-        "model_status",
-        "predicted_excess_return",
-        "outperform_probability",
-        "prediction_rank",
-        "lower_bound",
-        "upper_bound",
-        "interval_level",
-        "limitations",
-    ]
-    forecast_sheet = _sheet_from_dicts(workbook, "机器学习预测", result["forecasts"], forecast_headers)
+    forecast_headers = (
+        [
+            "horizon",
+            "symbol",
+            "label",
+            "feature_date",
+            "estimated_target_date",
+            "benchmark_symbol",
+            "model_name",
+            "model_version",
+            "model_status",
+            "predicted_excess_return",
+            "outperform_probability",
+            "predicted_direction",
+            "lower_bound",
+            "upper_bound",
+            "interval_level",
+            "limitations",
+        ]
+        if single_asset
+        else [
+            "horizon",
+            "symbol",
+            "label",
+            "industry",
+            "size_bucket",
+            "feature_date",
+            "estimated_target_date",
+            "benchmark_symbol",
+            "model_name",
+            "model_version",
+            "model_status",
+            "predicted_excess_return",
+            "outperform_probability",
+            "predicted_direction",
+            "prediction_rank",
+            "lower_bound",
+            "upper_bound",
+            "interval_level",
+            "limitations",
+        ]
+    )
+    forecast_sheet = _sheet_from_dicts(
+        workbook,
+        "单股超额收益预测" if single_asset else "机器学习预测",
+        result["forecasts"],
+        forecast_headers,
+    )
     _set_number_format(
         forecast_sheet,
         {"predicted_excess_return", "outperform_probability", "lower_bound", "upper_bound"},
@@ -461,18 +533,19 @@ def build_ml_workbook(
     )
     _set_number_format(explanation_sheet, {"feature_value", "local_prediction_difference"}, "0.000000")
 
-    group_headers = [
-        "horizon",
-        "model_name",
-        "model_version",
-        "fold",
-        "group",
-        "observations",
-        "average_actual_excess_return",
-        "win_rate",
-    ]
-    group_sheet = _sheet_from_dicts(workbook, "分组检验", result["group_tests"], group_headers)
-    _set_number_format(group_sheet, {"average_actual_excess_return", "win_rate"}, "0.0000%")
+    if not single_asset:
+        group_headers = [
+            "horizon",
+            "model_name",
+            "model_version",
+            "fold",
+            "group",
+            "observations",
+            "average_actual_excess_return",
+            "win_rate",
+        ]
+        group_sheet = _sheet_from_dicts(workbook, "分组检验", result["group_tests"], group_headers)
+        _set_number_format(group_sheet, {"average_actual_excess_return", "win_rate"}, "0.0000%")
 
     cost_headers = [
         "horizon",
@@ -480,6 +553,7 @@ def build_ml_workbook(
         "model_version",
         "fold",
         "scenario",
+        *(["strategy_type"] if single_asset else []),
         "periods",
         "transaction_cost_bps",
         "slippage_bps",
@@ -500,24 +574,43 @@ def build_ml_workbook(
     leakage_sheet = _sheet_from_dicts(
         workbook, "数据泄漏检查", result["leakage_checks"], ["check", "status", "details"]
     )
-    final_headers = [
-        "model_name",
-        "model_version",
-        "fold",
-        "split",
-        "symbol",
-        "industry",
-        "size_bucket",
-        "feature_date",
-        "target_date",
-        "horizon",
-        "predicted_excess_return",
-        "actual_excess_return",
-        "outperform_probability",
-        "actual_outperformed",
-        "training_rows",
-        "parameters",
-    ]
+    final_headers = (
+        [
+            "model_name",
+            "model_version",
+            "fold",
+            "split",
+            "symbol",
+            "feature_date",
+            "target_date",
+            "horizon",
+            "predicted_excess_return",
+            "actual_excess_return",
+            "outperform_probability",
+            "actual_outperformed",
+            "training_rows",
+            "parameters",
+        ]
+        if single_asset
+        else [
+            "model_name",
+            "model_version",
+            "fold",
+            "split",
+            "symbol",
+            "industry",
+            "size_bucket",
+            "feature_date",
+            "target_date",
+            "horizon",
+            "predicted_excess_return",
+            "actual_excess_return",
+            "outperform_probability",
+            "actual_outperformed",
+            "training_rows",
+            "parameters",
+        ]
+    )
     final_sheet = _sheet_from_dicts(workbook, "最终测试明细", result["final_predictions"], final_headers)
     _set_number_format(
         final_sheet,
@@ -605,7 +698,7 @@ def run_ml_task(
             "raw_rows": benchmark_quality["raw_rows"],
             "clean_rows": benchmark_quality["clean_rows"],
             "output_rows": len(benchmark_prices),
-            "notes": f"out_of_range={benchmark_out_of_range}; explicit benchmark index wheels",
+            "notes": f"out_of_range={benchmark_out_of_range}; explicit benchmark index",
         }
     ]
     if not benchmark_prices:
@@ -662,6 +755,7 @@ def run_ml_task(
             }
         )
 
+    single_asset = config["task_type"] == "single_asset"
     panel_rows, latest_rows, feature_names = build_excess_return_panel(
         subjects,
         benchmark_prices,
@@ -669,6 +763,7 @@ def run_ml_task(
         benchmark_type=config["benchmark"]["type"],
         benchmark_source=benchmark_provider,
         horizons=config["horizons"],
+        single_asset=single_asset,
     )
     result = run_ml_forecast_analysis(
         panel_rows,
@@ -683,6 +778,7 @@ def run_ml_task(
         minimum_training_dates=config["minimum_training_dates"],
         transaction_cost_bps=config["transaction_cost_bps"],
         slippage_bps=config["slippage_bps"],
+        single_asset=single_asset,
     )
     output = config["output"]
     if not output.is_absolute():
@@ -690,6 +786,7 @@ def run_ml_task(
     build_ml_workbook(output, config, result, source_rows)
     return {
         "status": result["status"],
+        "task_type": config["task_type"],
         "output": str(output),
         "subjects": len(subjects),
         "benchmark_symbol": config["benchmark"]["symbol"],
@@ -708,7 +805,7 @@ def run_ml_task(
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Train and validate stage-six A-share excess-return models from an explicit panel manifest"
+        description="Train and validate stage-six panel or stage-seven single-asset A-share excess-return models"
     )
     parser.add_argument("--manifest", required=True, type=Path)
     parser.add_argument("--cache-dir", type=Path, default=DEFAULT_CACHE_DIR)

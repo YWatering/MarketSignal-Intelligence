@@ -1,4 +1,4 @@
-# Stage-Six Data Contract
+# Machine-Learning Data Contract
 
 ## Request
 
@@ -258,6 +258,64 @@ symbol + feature_date + target_date + horizon
 Each row records adjusted stock return, benchmark return, excess return, outperform label, benchmark identity, membership metadata, adjustment method, and a feature mapping. Stock labels must use `qfq` prices. The final test is stored separately and is never used to alter the feature set, parameter grid, or outer-window candidate.
 
 See [ml_forecasting.md](ml_forecasting.md) for feature, model, validation, promotion, explanation, and workbook rules.
+
+## Single-Asset Excess-Return Contract
+
+Stage seven adds a separate `single_asset` task type. It uses the same online A-share adapters and point-in-time controls as the panel contract, but it accepts one explicitly requested stock and does not require a multi-stock universe.
+
+Required top-level fields:
+
+| Field | Requirement |
+| --- | --- |
+| `version` | Must equal `1.0`. |
+| `name` | Non-empty task name. |
+| `task_type` | Must equal `single_asset`. |
+| `market` | Must be `cn_a` in the first implementation. |
+| `mode` | Must be `online` for formal output. |
+| `symbol` | One explicitly supplied six-digit A-share code. |
+| `benchmark.symbol` | One explicitly supplied six-digit index code. |
+| `horizons` | One or more trading-step targets from 1 to 20. |
+| `output` | `.xlsx` workbook path. |
+
+The manifest may also provide `label`, `industry`, `size_bucket`, `start_date`, `end_date`, `include_context`, validation sizes, transaction costs, and slippage assumptions. `membership_policy` is normalized to `single_asset` and is not treated as a historical constituent claim.
+
+The single-asset normalized sample key remains:
+
+```text
+symbol + feature_date + target_date + horizon
+```
+
+Each row records:
+
+- Forward-adjusted stock return and benchmark return.
+- Excess return and `outperformed` label.
+- Explicit benchmark identity and common feature/target dates.
+- Point-in-time technical, financial, news, notice, and benchmark-context features.
+- `adjustment_method=qfq` for the stock price series.
+
+The minimum usable-history rule is applied to the aligned stock/index time series. Features must precede targets, and future financial, news, or notice information may not enter a feature row. Stage seven uses the same six candidate models and chronological split rules as the panel contract, but omits cross-sectional rank features, cross-sectional prediction ranks, and grouped-spread tests.
+
+### Single-Asset Workbook
+
+The formal single-asset workbook contains:
+
+| Sheet | Purpose |
+| --- | --- |
+| `README` | Task type, stock, benchmark, data sources, row counts, limitations, and status. |
+| `单股样本` | Aligned stock/index rows, excess-return labels, point-in-time features, and feature mapping. |
+| `单股超额收益预测` | Forecast horizon, predicted excess return, outperform probability, direction, interval, and benchmark identity. |
+| `模型排行榜` | Candidate metrics, status, gates, selection reason, and rejection reason. |
+| `滚动验证` | Chronological outer-window performance. |
+| `特征重要性` | Global training-only feature importance. |
+| `预测解释` | Local feature replacement differences for the current forecast. |
+| `成本敏感性` | Single-stock relative-sign strategy under no-cost, slippage-only, and base-cost scenarios. |
+| `数据泄漏检查` | Benchmark, adjustment, point-in-time, purging, random-split, and membership checks. |
+| `最终测试明细` | Locked final holdout predictions and actual excess returns. |
+| `参数搜索` | Finite inner-validation parameter candidates. |
+| `数据来源` | Stock, benchmark, context-data source and status records. |
+| `模型版本` | Contract, feature, engine, model, workbook, and random-seed versions. |
+
+The single-asset workbook intentionally does not include `分组检验`. Its cost evaluation reports a sign-of-prediction relative strategy: long the stock versus the benchmark when predicted excess return is positive, short the relative signal when negative, and remain neutral when the prediction is zero. This is a research diagnostic, not an executable trading instruction or a return guarantee.
 
 ## Error Behavior
 

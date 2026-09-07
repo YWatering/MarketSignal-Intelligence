@@ -1,0 +1,25 @@
+version: "1.0"
+name: maotai-single-excess-return
+task_type: single_asset
+market: cn_a
+mode: online
+symbol: "600519"
+label: 贵州茅台
+industry: 食品饮料
+size_bucket: 大市值
+start_date: 2023-01-01
+end_date: latest
+horizons: [1, 5]
+benchmark:
+  symbol: "000300"
+  label: 沪深300
+  type: market_index
+include_context: true
+final_test_dates: 40
+outer_test_dates: 20
+outer_folds: 3
+inner_validation_dates: 20
+minimum_training_dates: 120
+transaction_cost_bps: 10
+slippage_bps: 5
+output: outputs/maotai_single_excess_return.xlsx

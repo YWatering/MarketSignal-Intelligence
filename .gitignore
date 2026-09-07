@@ -9,3 +9,4 @@ outputs/*.xlsx
 !outputs/maotai_forecast.xlsx
 !outputs/china_liquor_batch.xlsx
 !outputs/china_a_ml_panel.xlsx
+!outputs/maotai_single_excess_return.xlsx

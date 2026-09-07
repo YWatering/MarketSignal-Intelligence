@@ -2,7 +2,7 @@
 
 MarketSignal Intelligence 是一个面向中国股票市场和美国股票市场的 Agent Skill。它可以针对单只或多只明确指定的股票采集行情、财务、公告与相关新闻，完成清洗、去重、范围处理、中文或英文关键词舆情分类、指标计算、数据质量检查、预测、横向比较和可追溯 Excel 交付。
 
-当前仓库已完成阶段六：在阶段五单股价格预测和多主体任务基础上，新增面向 A 股的多股票超额收益面板、机器学习候选模型、嵌套时序验证、独立最终测试集、模型准入机制和可解释 Excel 报告。
+当前仓库已完成阶段七：在阶段五单股价格预测、阶段六多股票超额收益面板基础上，新增单只 A 股相对显式基准指数的超额收益预测模式、单股时间序列验证和单股相对基准成本评价。
 
 ## 当前能力
 
@@ -38,6 +38,9 @@ MarketSignal Intelligence 是一个面向中国股票市场和美国股票市场
 - 计算 MAE、RMSE、样本外 R²、IC、Rank IC、方向准确率、F1、AUC、Brier Score 和概率校准误差。
 - 输出高低预测组收益差、胜率、换手率、最大回撤及无成本、滑点和基础成本场景。
 - 当机器学习没有通过外部窗口、最终测试、成本或数据治理门槛时，继续选择简单模型并记录拒绝原因。
+- 支持 `single_asset` 单股模式：使用一只 A 股和一个显式基准指数计算并预测未来 1 日、5 日或自定义周期的超额收益率。
+- 单股模式保留个股、基准、财务、新闻和公告的点时特征，但不生成不适用的横截面排名、高低组和分组检验。
+- 将预测方向转换为单股相对基准信号，输出方向准确率、跑赢概率、累计相对收益、换手率和成本后回撤。
 
 ## 支持的市场代码
 
@@ -190,6 +193,36 @@ export MARKETSIGNAL_SEC_USER_AGENT="MarketSignal Intelligence contact@example.co
 
 直方图梯度提升使用 scikit-learn 内置实现，避免引入 XGBoost 或 LightGBM 的额外系统运行库，同时保留有限梯度提升树候选的检验目的。
 
+## 阶段七单股超额收益预测
+
+阶段七增加独立的 `single_asset` 清单入口，用于回答“指定的一只股票相对指定基准，未来可能产生多少超额收益”这一研究问题。它不会替换阶段五的绝对股价预测，也不会改变阶段六多股票面板的最低股票数量约束。
+
+先验证贵州茅台相对沪深 300 的清单：
+
+```bash
+.venv/bin/python scripts/market_ml.py \
+  --manifest examples/china_maotai_single_excess_return.yaml \
+  --validate-only
+```
+
+执行真实数据采集、单股模型比较、验证和 Excel 导出：
+
+```bash
+.venv/bin/python scripts/market_ml.py \
+  --manifest examples/china_maotai_single_excess_return.yaml
+```
+
+单股模式的关键约束如下：
+
+1. 必须提供一只 A 股和一个显式基准指数，不自动替换基准。
+2. 使用个股前复权价格和基准指数收盘价计算超额收益率，特征日与目标日严格分离。
+3. 继续使用零超额收益、历史平均超额收益、Ridge、Elastic Net、Random Forest 和 HistGradientBoosting 六类候选模型。
+4. 使用嵌套时序验证、重叠标签清除和独立最终测试；最终测试不参与参数、特征或模型选择。
+5. 单股模式不生成横截面排名和高低预测组，而是输出单股预测方向、跑赢概率、经验区间及相对基准成本敏感性。
+6. 如果机器学习模型没有通过准入门槛，系统可以继续选择简单基准，并在模型排行榜中记录拒绝原因。
+
+阶段七工作簿包括 `README`、`单股样本`、`单股超额收益预测`、`模型排行榜`、`滚动验证`、`特征重要性`、`预测解释`、`成本敏感性`、`数据泄漏检查`、`最终测试明细`、`参数搜索`、`数据来源` 和 `模型版本`；单股模式不生成 `分组检验`。
+
 ## 阶段四多主体任务
 
 批量任务使用版本化清单。`portfolio`、`industry` 和 `theme` 都要求明确列出股票，不自动猜测行业或主题成分。
@@ -316,13 +349,13 @@ outputs/china_liquor_batch.xlsx
 ├── scripts/marketsignal.py     # 多市场采集、清洗、指标计算和 Excel 导出
 ├── scripts/forecasting.py      # 特征构造、走步回测、模型训练和未来预测
 ├── scripts/market_batch.py     # 多主体清单、重试、隔离、调度状态和汇总导出
-├── scripts/market_ml.py        # 阶段六面板清单、真实数据采集和 Excel 导出
+├── scripts/market_ml.py        # 阶段六面板、阶段七单股清单和 Excel 导出
 ├── scripts/ml_forecasting.py   # 超额收益面板、机器学习、嵌套验证和准入规则
 ├── scripts/operations.py       # 结构化日志、重试、间隔判断和行情交叉校验
 ├── scripts/versioning.py       # 组件版本注册表
 ├── scripts/run_sample.py       # 固定样例入口
 ├── scripts/run_acceptance.py   # 确定性端到端验收入口
-├── examples/                   # 多股票、行业或主题任务清单示例
+├── examples/                   # 多股票、单股、行业或主题任务清单示例
 ├── fixtures/                   # 美股行情、新闻、主体、财务和申报测试数据
 ├── references/data_contract.md # 输入、输出、数据字段和错误约定
 ├── references/forecasting.md   # 阶段五模型、选择、防泄漏和评估规则
@@ -344,7 +377,7 @@ outputs/china_liquor_batch.xlsx
 .venv/bin/python scripts/run_acceptance.py
 ```
 
-38 项测试覆盖早期阶段回归、四类市场、数据治理、真实数据预测、时间可用性、多主体清单、重试恢复、失败隔离、调度间隔、行情交叉校验、版本注册、五模型选择、阶段六面板标签、嵌套时序验证、模型准入和 Excel 契约。`run_acceptance.py` 使用固定样例执行完整批量入口、单股报告和汇总报告验收。阶段实施方式与实际验证记录见 [工作计划.md](工作计划.md)。
+42 项测试覆盖早期阶段回归、四类市场、数据治理、真实数据预测、时间可用性、多主体清单、重试恢复、失败隔离、调度间隔、行情交叉校验、版本注册、五模型选择、阶段六面板标签、嵌套时序验证、模型准入、阶段七单股标签和 Excel 契约。`run_acceptance.py` 使用固定样例执行完整批量入口、单股报告和汇总报告验收。阶段实施方式与实际验证记录见 [工作计划.md](工作计划.md)。
 
 ## 使用边界
 

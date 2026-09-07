@@ -24,6 +24,7 @@ from sklearn.metrics import (
     roc_auc_score,
 )
 from sklearn.pipeline import Pipeline
+from sklearn.exceptions import ConvergenceWarning
 from forecasting import FEATURE_DESCRIPTIONS, FEATURE_WINDOW, build_feature_vector
 from versioning import (
     ELASTIC_NET_MODEL_VERSION,
@@ -176,12 +177,15 @@ def build_excess_return_panel(
     benchmark_type: str,
     benchmark_source: str,
     horizons: Iterable[int] = (1, 5),
+    single_asset: bool = False,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[str]]:
     """Build labeled and latest prediction rows using point-in-time features."""
     normalized_horizons = tuple(sorted({int(value) for value in horizons}))
     if not normalized_horizons or any(value < 1 or value > 20 for value in normalized_horizons):
         raise MLForecastError("panel horizons must contain trading-step values from 1 to 20")
-    if len(subjects) < 2:
+    if not subjects:
+        raise MLForecastError("machine-learning task requires at least one explicitly supplied stock")
+    if len(subjects) < 2 and not single_asset:
         raise MLForecastError("machine-learning panel requires at least two explicitly supplied stocks")
     benchmark = _ordered_prices(benchmark_prices)
     benchmark_dates = {str(row["date"]) for row in benchmark}
@@ -227,7 +231,8 @@ def build_excess_return_panel(
                     subject.get("announcements", []),
                 )
                 features.update(_market_features(stock_history, benchmark_history))
-                features.update(_categorical_features(subject))
+                if not single_asset:
+                    features.update(_categorical_features(subject))
                 stock_return = float(stock[feature_index + horizon]["close"]) / float(stock[feature_index]["close"]) - 1.0
                 benchmark_return = (
                     float(aligned_benchmark[feature_index + horizon]["close"])
@@ -259,7 +264,8 @@ def build_excess_return_panel(
                 subject.get("announcements", []),
             )
             latest_features.update(_market_features(latest_history, benchmark_history))
-            latest_features.update(_categorical_features(subject))
+            if not single_asset:
+                latest_features.update(_categorical_features(subject))
             latest.append(
                 {
                     **common_fields,
@@ -269,8 +275,9 @@ def build_excess_return_panel(
                     "features": latest_features,
                 }
             )
-    _add_cross_sectional_ranks(labeled)
-    _add_cross_sectional_ranks(latest)
+    if not single_asset:
+        _add_cross_sectional_ranks(labeled)
+        _add_cross_sectional_ranks(latest)
     feature_names = sorted({name for row in labeled + latest for name in row["features"]})
     for row in labeled + latest:
         for feature_name in feature_names:
@@ -394,6 +401,7 @@ def _fit_model(
         fitted = _estimator(model_name, params)
         with warnings.catch_warnings():
             warnings.filterwarnings("ignore", message=".*encountered in matmul", category=RuntimeWarning)
+            warnings.filterwarnings("ignore", category=ConvergenceWarning)
             fitted.fit(x, y)
             train_prediction = np.asarray(fitted.predict(x), dtype=float)
         value = None
@@ -682,12 +690,81 @@ def _economic_evaluation(
     return results
 
 
+def _single_asset_economic_evaluation(
+    predictions: list[dict[str, Any]],
+    *,
+    fold: str,
+    horizon: int,
+    transaction_cost_bps: float,
+    slippage_bps: float,
+) -> list[dict[str, Any]]:
+    """Evaluate a sign-of-prediction relative strategy for one stock."""
+    by_model: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for row in predictions:
+        by_model[row["model_name"]].append(row)
+    scenarios = (
+        ("no_cost", 0.0, 0.0),
+        ("slippage_only", 0.0, slippage_bps),
+        ("base_cost", transaction_cost_bps, slippage_bps),
+    )
+    results: list[dict[str, Any]] = []
+    for model_name in MODEL_ORDER:
+        rows = sorted(by_model.get(model_name, []), key=lambda row: row["target_date"])
+        if not rows:
+            continue
+        for scenario, transaction, slippage in scenarios:
+            equity = 1.0
+            peak = 1.0
+            max_drawdown = 0.0
+            previous_position = 0
+            gross_values: list[float] = []
+            net_values: list[float] = []
+            turnovers: list[float] = []
+            for row in rows:
+                prediction = float(row["predicted_excess_return"])
+                position = 1 if prediction > 0 else -1 if prediction < 0 else 0
+                actual = float(row["actual_excess_return"])
+                turnover = abs(position - previous_position)
+                cost = turnover * (transaction + slippage) / 10000.0
+                gross = position * actual
+                net = gross - cost
+                equity *= 1.0 + net
+                peak = max(peak, equity)
+                max_drawdown = max(max_drawdown, 1.0 - equity / peak)
+                gross_values.append(gross)
+                net_values.append(net)
+                turnovers.append(float(turnover))
+                previous_position = position
+            gross_equity = float(np.prod(1.0 + np.asarray(gross_values)))
+            results.append(
+                {
+                    "horizon": horizon,
+                    "model_name": model_name,
+                    "model_version": MODEL_VERSIONS[model_name],
+                    "fold": fold,
+                    "scenario": scenario,
+                    "strategy_type": "single_asset_relative_sign",
+                    "periods": len(net_values),
+                    "transaction_cost_bps": transaction,
+                    "slippage_bps": slippage,
+                    "cumulative_gross_return": gross_equity - 1.0,
+                    "cumulative_net_return": equity - 1.0,
+                    "average_spread_return": float(np.mean(net_values)),
+                    "win_rate": float(np.mean(np.asarray(net_values) > 0)),
+                    "turnover": float(np.sum(turnovers)),
+                    "max_drawdown": max_drawdown,
+                }
+            )
+    return results
+
+
 def _leakage_checks(
     rows: list[dict[str, Any]],
     latest_rows: list[dict[str, Any]],
     *,
     benchmark_symbol: str,
     membership_policy: str,
+    single_asset: bool = False,
 ) -> list[dict[str, Any]]:
     checks = [
         {
@@ -722,9 +799,11 @@ def _leakage_checks(
         },
         {
             "check": "historical_membership",
-            "status": "pass" if membership_policy == "historical_constituents" else "warning",
+            "status": "pass" if single_asset or membership_policy == "historical_constituents" else "warning",
             "details": (
-                "historical constituent records supplied"
+                "historical membership is not applicable to a single explicitly requested asset"
+                if single_asset
+                else "historical constituent records supplied"
                 if membership_policy == "historical_constituents"
                 else "user-supplied fixed universe is auditable but does not eliminate survivorship bias"
             ),
@@ -833,6 +912,7 @@ def run_ml_forecast_analysis(
     minimum_training_dates: int = 120,
     transaction_cost_bps: float = 10.0,
     slippage_bps: float = 5.0,
+    single_asset: bool = False,
 ) -> dict[str, Any]:
     """Run nested chronological validation without forcing an ML model to win."""
     if final_test_dates < 10 or outer_test_dates < 10 or inner_validation_dates < 10:
@@ -846,6 +926,7 @@ def run_ml_forecast_analysis(
         latest_rows,
         benchmark_symbol=benchmark_symbol,
         membership_policy=membership_policy,
+        single_asset=single_asset,
     )
     blocking_leakage = any(row["status"] != "pass" for row in leakage_checks)
     rolling_rows: list[dict[str, Any]] = []
@@ -909,16 +990,27 @@ def run_ml_forecast_analysis(
                         **metrics,
                     }
                 )
-        group_rows.extend(_group_test_rows(outer_predictions, "outer_all", horizon))
-        cost_rows.extend(
-            _economic_evaluation(
-                outer_predictions,
-                fold="outer_all",
-                horizon=horizon,
-                transaction_cost_bps=transaction_cost_bps,
-                slippage_bps=slippage_bps,
+        if single_asset:
+            cost_rows.extend(
+                _single_asset_economic_evaluation(
+                    outer_predictions,
+                    fold="outer_all",
+                    horizon=horizon,
+                    transaction_cost_bps=transaction_cost_bps,
+                    slippage_bps=slippage_bps,
+                )
             )
-        )
+        else:
+            group_rows.extend(_group_test_rows(outer_predictions, "outer_all", horizon))
+            cost_rows.extend(
+                _economic_evaluation(
+                    outer_predictions,
+                    fold="outer_all",
+                    horizon=horizon,
+                    transaction_cost_bps=transaction_cost_bps,
+                    slippage_bps=slippage_bps,
+                )
+            )
 
         final_fits: dict[str, dict[str, Any]] = {}
         for model_name in MODEL_ORDER:
@@ -998,15 +1090,26 @@ def run_ml_forecast_analysis(
             for name in MODEL_ORDER
         }
         final_simple_rmse = min(final_metrics[name]["rmse"] for name in SIMPLE_MODELS)
-        base_cost_by_model = {
-            row["model_name"]: row
-            for row in _economic_evaluation(
+        cost_evaluations = (
+            _single_asset_economic_evaluation(
                 outer_predictions,
                 fold="outer_all_selection",
                 horizon=horizon,
                 transaction_cost_bps=transaction_cost_bps,
                 slippage_bps=slippage_bps,
             )
+            if single_asset
+            else _economic_evaluation(
+                outer_predictions,
+                fold="outer_all_selection",
+                horizon=horizon,
+                transaction_cost_bps=transaction_cost_bps,
+                slippage_bps=slippage_bps,
+            )
+        )
+        base_cost_by_model = {
+            row["model_name"]: row
+            for row in cost_evaluations
             if row["scenario"] == "base_cost"
         }
         candidate_passes_final = (
@@ -1089,7 +1192,8 @@ def run_ml_forecast_analysis(
                     "model_status": "selected",
                     "predicted_excess_return": float(prediction),
                     "outperform_probability": float(probability),
-                    "prediction_rank": ranks[index],
+                    "predicted_direction": 1 if prediction > 0 else -1 if prediction < 0 else 0,
+                    "prediction_rank": "not_applicable" if single_asset else ranks[index],
                     "lower_bound": float(prediction - interval),
                     "upper_bound": float(prediction + interval),
                     "interval_level": INTERVAL_LEVEL,
@@ -1100,6 +1204,7 @@ def run_ml_forecast_analysis(
 
     return {
         "status": "pass" if not blocking_leakage else "warning",
+        "task_type": "single_asset" if single_asset else "panel",
         "engine_version": ML_FORECAST_ENGINE_VERSION,
         "feature_version": ML_FEATURE_VERSION,
         "random_seed": RANDOM_SEED,

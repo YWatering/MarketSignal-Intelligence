@@ -3,15 +3,17 @@
 from __future__ import annotations
 
 
-SKILL_VERSION = "6.0"
-DATA_CONTRACT_VERSION = "6.0"
+SKILL_VERSION = "7.0"
+DATA_CONTRACT_VERSION = "7.0"
 BATCH_CONTRACT_VERSION = "2.0"
 ML_PANEL_CONTRACT_VERSION = "1.0"
+SINGLE_ASSET_CONTRACT_VERSION = "1.0"
 SOURCE_ADAPTER_VERSION = "6.0"
 FORECAST_ENGINE_VERSION = "5.0"
 ML_FORECAST_ENGINE_VERSION = "1.0"
+SINGLE_ASSET_ENGINE_VERSION = "1.0"
 ML_FEATURE_VERSION = "1.0"
-WORKBOOK_TEMPLATE_VERSION = "6.0"
+WORKBOOK_TEMPLATE_VERSION = "7.0"
 BASELINE_MODEL_VERSION = "persistence-v1"
 MOVING_AVERAGE_MODEL_VERSION = "moving-average-v1"
 HISTORICAL_MEAN_MODEL_VERSION = "historical-mean-v1"
@@ -31,9 +33,11 @@ def component_versions() -> dict[str, str]:
         "data_contract": DATA_CONTRACT_VERSION,
         "batch_contract": BATCH_CONTRACT_VERSION,
         "ml_panel_contract": ML_PANEL_CONTRACT_VERSION,
+        "single_asset_contract": SINGLE_ASSET_CONTRACT_VERSION,
         "source_adapters": SOURCE_ADAPTER_VERSION,
         "forecast_engine": FORECAST_ENGINE_VERSION,
         "ml_forecast_engine": ML_FORECAST_ENGINE_VERSION,
+        "single_asset_engine": SINGLE_ASSET_ENGINE_VERSION,
         "ml_features": ML_FEATURE_VERSION,
         "workbook_template": WORKBOOK_TEMPLATE_VERSION,
         "last_close_baseline": BASELINE_MODEL_VERSION,

@@ -1,7 +1,7 @@
 interface:
   display_name: "MarketSignal Intelligence"
   short_description: "Research stocks and validate price or excess-return forecasts"
-  default_prompt: "Use $market-signal-intelligence to research or compare specified China or US stocks from real data, validate sources, run explainable price forecasts or strict A-share panel excess-return model tests when requested, and export traceable Excel reports."
+  default_prompt: "Use $market-signal-intelligence to research or compare specified China or US stocks from real data, validate sources, run explainable price forecasts, single-asset benchmark-relative excess-return forecasts, or strict A-share panel excess-return model tests when requested, and export traceable Excel reports."
 
 policy:
   allow_implicit_invocation: true
